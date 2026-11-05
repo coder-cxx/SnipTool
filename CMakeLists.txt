@@ -4,16 +4,16 @@ project(SnipTool VERSION 1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Windows subsystem (no console)
+# Treat as Windows GUI application (uses wWinMain, no console)
+set(CMAKE_WIN32_EXECUTABLE TRUE)
+
 if(MSVC)
-    add_compile_options(/W4 /permissive- /Zc:__cplusplus)
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /SUBSYSTEM:WINDOWS")
+    add_compile_options(/W4 /permissive- /Zc:__cplusplus /D_CRT_SECURE_NO_WARNINGS)
 else()
     add_compile_options(-Wall -Wextra)
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -mwindows")
 endif()
 
-add_executable(SnipTool
+add_executable(SnipTool WIN32
     src/main.cpp
     src/SnipOverlay.cpp
     src/ImageEditor.cpp
@@ -30,7 +30,7 @@ target_link_libraries(SnipTool PRIVATE
     comdlg32
 )
 
-# For MinGW
+# For MinGW static runtime
 if(MINGW)
     target_link_libraries(SnipTool PRIVATE -static-libgcc -static-libstdc++)
 endif()

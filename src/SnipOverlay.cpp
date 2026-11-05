@@ -58,18 +58,12 @@ bool CaptureFullScreen() {
 }
 
 void DrawOverlay(HDC hdc) {
-    // Dim the whole screen
-    HBRUSH dimBrush = CreateSolidBrush(RGB(0, 0, 0));
     RECT full{ 0, 0, g_state.screenW, g_state.screenH };
-    
+
     // First blit the original screenshot
     BitBlt(hdc, 0, 0, g_state.screenW, g_state.screenH, g_state.memDC, 0, 0, SRCCOPY);
 
-    // Then apply semi-transparent dark overlay using AlphaBlend-like effect via GDI
-    // Simple approach: draw dark rect with pattern or just solid + SetROP2
-    // Better: use layered window, but for simplicity we draw selection on top.
-
-    // For proper dim we use a semi-transparent brush via AlphaBlend
+    // Semi-transparent dark overlay via AlphaBlend
     HDC dimDC = CreateCompatibleDC(hdc);
     HBITMAP dimBmp = CreateCompatibleBitmap(hdc, g_state.screenW, g_state.screenH);
     HBITMAP oldDim = (HBITMAP)SelectObject(dimDC, dimBmp);
