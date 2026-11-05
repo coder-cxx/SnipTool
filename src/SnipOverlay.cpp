@@ -200,7 +200,7 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
     int top  = GetSystemMetrics(SM_YVIRTUALSCREEN);
 
     HWND hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         L"SnipOverlayClass", L"",
         WS_POPUP,
         left, top, g_state.screenW, g_state.screenH,
@@ -212,9 +212,6 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
     }
 
     g_state.hwnd = hwnd;
-
-    // Make it almost opaque (we handle dimming ourselves)
-    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
 
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);

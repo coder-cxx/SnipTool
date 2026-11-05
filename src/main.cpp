@@ -9,16 +9,49 @@
 
 // Hotkey ID
 constexpr int HOTKEY_ID = 1;
+constexpr UINT WM_TRAYICON = WM_APP + 1;
 
 // Global instance for message handling
 HINSTANCE g_hInstance = nullptr;
 HWND g_hwndMain = nullptr;
+NOTIFYICONDATAW g_nid{};
+
+void ShowTrayMenu(HWND hwnd) {
+    POINT pt;
+    GetCursorPos(&pt);
+
+    HMENU hMenu = CreatePopupMenu();
+    if (!hMenu) return;
+
+    AppendMenuW(hMenu, MF_STRING, 1, L"Capture (Ctrl+Shift+S)");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, 2, L"Exit");
+
+    // Required so the menu closes correctly when clicking outside
+    SetForegroundWindow(hwnd);
+
+    UINT cmd = TrackPopupMenu(hMenu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        pt.x, pt.y, 0, hwnd, nullptr);
+
+    DestroyMenu(hMenu);
+
+    // Required after TrackPopupMenu
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+
+    if (cmd == 1) {
+        // Trigger capture the same way as hotkey
+        PostMessageW(hwnd, WM_HOTKEY, HOTKEY_ID, 0);
+    }
+    else if (cmd == 2) {
+        DestroyWindow(hwnd);
+    }
+}
 
 LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_HOTKEY:
         if (wParam == HOTKEY_ID) {
-            // Start snipping
             RECT selected{};
             HBITMAP hBmp = SnipOverlay::CaptureRegion(g_hInstance, selected);
             if (hBmp) {
@@ -28,10 +61,23 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             }
         }
         break;
+
+    case WM_TRAYICON:
+        if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
+            ShowTrayMenu(hwnd);
+        }
+        else if (lParam == WM_LBUTTONDBLCLK) {
+            // Double-click also starts capture
+            PostMessageW(hwnd, WM_HOTKEY, HOTKEY_ID, 0);
+        }
+        break;
+
     case WM_DESTROY:
         UnregisterHotKey(hwnd, HOTKEY_ID);
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
         break;
+
     default:
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
@@ -63,30 +109,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         MessageBoxW(nullptr, L"Failed to register hotkey Ctrl+Shift+S.\nMaybe already in use.", L"SnipTool", MB_ICONWARNING);
     }
 
-    // Optional: tray icon for quit
-    NOTIFYICONDATAW nid{ sizeof(nid) };
-    nid.hWnd = g_hwndMain;
-    nid.uID = 1;
-    nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
-    nid.uCallbackMessage = WM_APP + 1;
-    nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); // IDI_APPLICATION
-    wcscpy_s(nid.szTip, L"SnipTool — Ctrl+Shift+S to capture");
-    Shell_NotifyIconW(NIM_ADD, &nid);
+    // Tray icon
+    g_nid = { sizeof(g_nid) };
+    g_nid.hWnd = g_hwndMain;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); // IDI_APPLICATION
+    wcscpy_s(g_nid.szTip, L"SnipTool — Ctrl+Shift+S to capture");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0)) {
-        if (msg.message == WM_APP + 1) {
-            if (msg.lParam == WM_RBUTTONUP || msg.lParam == WM_LBUTTONUP) {
-                // Simple quit on tray click
-                if (MessageBoxW(nullptr, L"Exit SnipTool?", L"SnipTool", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                    DestroyWindow(g_hwndMain);
-                }
-            }
-        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
-    Shell_NotifyIconW(NIM_DELETE, &nid);
     return static_cast<int>(msg.wParam);
 }

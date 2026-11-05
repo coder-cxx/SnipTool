@@ -1,11 +1,16 @@
-name: Build SnipTool
+name: Build & Release SnipTool
 
 on:
   push:
     branches: [ main, master ]
+    tags:
+      - 'v*'
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-windows:
@@ -31,10 +36,26 @@ jobs:
         path: build/SnipTool.exe
         if-no-files-found: error
 
-    - name: Create release asset (on tag)
+    - name: Create GitHub Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
       with:
         files: build/SnipTool.exe
+        name: SnipTool ${{ github.ref_name }}
+        body: |
+          ### SnipTool ${{ github.ref_name }}
+          
+          Простая утилита «Ножницы + рисовалка».
+          
+          **Горячая клавиша:** `Ctrl + Shift + S`
+          
+          - Выбор области с затемнением
+          - Рисование (карандаш, линия, прямоугольник)
+          - Копирование в буфер и сохранение в PNG/BMP
+          - Контекстное меню в трее → Exit
+          
+          Просто скачайте `SnipTool.exe` и запустите.
+        draft: false
+        prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
