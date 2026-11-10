@@ -4,12 +4,12 @@
 #include <windowsx.h>
 #include <algorithm>
 #include <vector>
+#include <string>
 
-// Подключаем DXGI и Direct3D 11 для "чистого" захвата
-#include <d3d11.h>
-#include <dxgi1_2.h>
-#pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "dxgi.lib")
+// Флаг для PrintWindow, заставляющий рендерить полное содержимое (игнорирует оверлеи)
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 0x00000002
+#endif
 
 namespace {
 
@@ -44,126 +44,163 @@ void CleanupMem() {
     }
 }
 
-// === СПОСОБ 2: DXGI Desktop Duplication (Чистый захват с GPU) ===
-HBITMAP CaptureScreenDXGI(int& outW, int& outH) {
-    HRESULT hr;
-    HBITMAP hResultBmp = nullptr;
+// Проверяет, является ли окно ватермаркой/оверлеем, который нужно игнорировать
+bool IsWatermarkWindow(HWND hwnd) {
+    if (!hwnd) return true;
+    
+    wchar_t className[256] = {0};
+    wchar_t windowName[256] = {0};
+    GetClassNameW(hwnd, className, 256);
+    GetWindowTextW(hwnd, windowName, 256);
 
-    // 1. Инициализация COM
-    hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr)) return nullptr;
+    std::wstring cls(className);
+    std::wstring title(windowName);
 
-    // 2. Создание D3D11 устройства
-    ID3D11Device* device = nullptr;
-    ID3D11DeviceContext* context = nullptr;
-    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
-                           D3D11_SDK_VERSION, &device, nullptr, &context);
-    if (FAILED(hr)) {
-        CoUninitialize();
-        return nullptr;
-    }
+    // ДОБАВЬТЕ СЮДА КЛАСС ИЛИ ИМЯ ВАШЕЙ ВАТЕРМАРКИ, если знаете его
+    // Например, если ватермарка имеет класс "WatermarkClass" или заголовок "Activate"
+    const std::vector<std::wstring> blacklist = {
+        L"Watermark", L"Overlay", L"ActivateWindows", L"GameBar", 
+        L"Xbox", L"Toast", L"Notification", L"SnipOverlayClass"
+    };
 
-    // 3. Получение DXGI адаптера и вывода (монитора)
-    IDXGIDevice* dxgiDevice = nullptr;
-    hr = device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
-    if (SUCCEEDED(hr)) {
-        IDXGIAdapter* adapter = nullptr;
-        hr = dxgiDevice->GetAdapter(&adapter);
-        if (SUCCEEDED(hr)) {
-            IDXGIOutput* output = nullptr;
-            hr = adapter->EnumOutputs(0, &output); // 0 = основной монитор
-            if (SUCCEEDED(hr)) {
-                IDXGIOutput1* output1 = nullptr;
-                hr = output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
-                if (SUCCEEDED(hr)) {
-                    // 4. Создание дубликата вывода
-                    IDXGIOutputDuplication* duplication = nullptr;
-                    hr = output1->DuplicateOutput(device, &duplication);
-                    if (SUCCEEDED(hr)) {
-                        // 5. Захват кадра
-                        DXGI_OUTDUPL_FRAME_INFO frameInfo;
-                        IDXGIResource* resource = nullptr;
-                        hr = duplication->AcquireNextFrame(1000, &frameInfo, &resource);
-                        
-                        if (SUCCEEDED(hr) && resource) {
-                            // 6. Получение текстуры
-                            ID3D11Texture2D* tex = nullptr;
-                            hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
-                            if (SUCCEEDED(hr)) {
-                                D3D11_TEXTURE2D_DESC desc;
-                                tex->GetDesc(&desc);
-                                outW = desc.Width;
-                                outH = desc.Height;
-
-                                // 7. Создание staging-текстуры для чтения CPU
-                                desc.Usage = D3D11_USAGE_STAGING;
-                                desc.BindFlags = 0;
-                                desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                                desc.MiscFlags = 0;
-                                
-                                ID3D11Texture2D* stagingTex = nullptr;
-                                hr = device->CreateTexture2D(&desc, nullptr, &stagingTex);
-                                if (SUCCEEDED(hr)) {
-                                    // 8. Копирование и маппинг
-                                    context->CopyResource(stagingTex, tex);
-                                    D3D11_MAPPED_SUBRESOURCE mapped;
-                                    hr = context->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
-                                    
-                                    if (SUCCEEDED(hr)) {
-                                        // 9. Конвертация в HBITMAP
-                                        BITMAPINFO bmi{};
-                                        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                                        bmi.bmiHeader.biWidth = outW;
-                                        bmi.bmiHeader.biHeight = -outH; // top-down
-                                        bmi.bmiHeader.biPlanes = 1;
-                                        bmi.bmiHeader.biBitCount = 32;
-                                        bmi.bmiHeader.biCompression = BI_RGB;
-
-                                        HDC hdc = GetDC(nullptr);
-                                        void* bits = nullptr;
-                                        hResultBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-                                        
-                                        if (hResultBmp && bits) {
-                                            // Копируем пиксели (BGRA)
-                                            uint8_t* src = static_cast<uint8_t*>(mapped.pData);
-                                            uint8_t* dst = static_cast<uint8_t*>(bits);
-                                            size_t rowBytes = outW * 4;
-                                            
-                                            for (int y = 0; y < outH; ++y) {
-                                                memcpy(dst + y * rowBytes, src + y * mapped.RowPitch, rowBytes);
-                                            }
-                                        }
-                                        ReleaseDC(nullptr, hdc);
-                                        context->Unmap(stagingTex, 0);
-                                    }
-                                    if (stagingTex) stagingTex->Release();
-                                }
-                                tex->Release();
-                            }
-                            duplication->ReleaseFrame();
-                            duplication->Release();
-                        }
-                        if (resource) resource->Release();
-                    }
-                    output1->Release();
-                }
-                output->Release();
-            }
-            adapter->Release();
+    for (const auto& banned : blacklist) {
+        if (cls.find(banned) != std::wstring::npos || title.find(banned) != std::wstring::npos) {
+            return true;
         }
-        dxgiDevice->Release();
     }
-
-    // 10. Очистка
-    if (context) context->Release();
-    if (device) device->Release();
-    CoUninitialize();
-
-    return hResultBmp;
+    return false;
 }
 
-// === FALLBACK: Старый метод, если DXGI не сработал ===
-bool CaptureFullScreenFallback() {
+// Структура для хранения информации об окне
+struct WindowInfo {
+    HWND hwnd;
+    RECT rect;
+};
+
+// Callback для EnumWindows - собирает все видимые окна
+BOOL CALLBACK CollectWindows(HWND hwnd, LPARAM lParam) {
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    if (IsWatermarkWindow(hwnd)) return TRUE; // Пропускаем ватермарку!
+    if (hwnd == g_state.hwnd) return TRUE; // Пропускаем наш собственный оверлей
+    
+    // Пропускаем системные оболочки
+    if (hwnd == GetShellWindow()) return TRUE;
+    
+    wchar_t cls[256] = {0};
+    GetClassNameW(hwnd, cls, 256);
+    
+    // Пропускаем рабочий стол и панель задач (их захватим отдельно)
+    if (wcscmp(cls, L"Progman") == 0 || 
+        wcscmp(cls, L"WorkerW") == 0 || 
+        wcscmp(cls, L"Shell_TrayWnd") == 0 ||
+        wcscmp(cls, L"Windows.UI.Core.CoreWindow") == 0) {
+        return TRUE; 
+    }
+
+    RECT rc;
+    if (!GetWindowRect(hwnd, &rc)) return TRUE;
+    
+    // Пропускаем окна за пределами экрана или минимизированные
+    if (rc.left >= g_state.screenW + g_state.screenLeft || 
+        rc.top >= g_state.screenH + g_state.screenTop || 
+        rc.right <= g_state.screenLeft || 
+        rc.bottom <= g_state.screenTop || 
+        IsIconic(hwnd) ||
+        (rc.right - rc.left) <= 0 || 
+        (rc.bottom - rc.top) <= 0) {
+        return TRUE;
+    }
+
+    auto& windows = *reinterpret_cast<std::vector<WindowInfo>*>(lParam);
+    windows.push_back({hwnd, rc});
+    
+    return TRUE; // Продолжаем перечисление
+}
+
+// Захватывает фон рабочего стола (обои)
+void CaptureDesktopBackground() {
+    // Заполняем базовым цветом
+    HBRUSH hBrush = CreateSolidBrush(RGB(30, 30, 30));
+    RECT rc = {0, 0, g_state.screenW, g_state.screenH};
+    FillRect(g_state.memDC, &rc, hBrush);
+    DeleteObject(hBrush);
+
+    // Пытаемся захватить реальный рабочий стол через PrintWindow
+    HWND hDesktop = GetDesktopWindow();
+    if (hDesktop) {
+        PrintWindow(hDesktop, g_state.memDC, PW_RENDERFULLCONTENT);
+    }
+}
+
+// Рисует одно окно на общем холсте
+void DrawWindowToCanvas(const WindowInfo& winInfo) {
+    HWND hwnd = winInfo.hwnd;
+    const RECT& rc = winInfo.rect;
+
+    int width = rc.right - rc.left;
+    int height = rc.bottom - rc.top;
+
+    // Создаём временный DC для этого окна
+    HDC hdcWindow = GetDC(hwnd);
+    if (!hdcWindow) return;
+    
+    HDC memDCWindow = CreateCompatibleDC(hdcWindow);
+    if (!memDCWindow) {
+        ReleaseDC(hwnd, hdcWindow);
+        return;
+    }
+    
+    HBITMAP hBmpWindow = CreateCompatibleBitmap(hdcWindow, width, height);
+    if (!hBmpWindow) {
+        DeleteDC(memDCWindow);
+        ReleaseDC(hwnd, hdcWindow);
+        return;
+    }
+    
+    HBITMAP oldBmp = (HBITMAP)SelectObject(memDCWindow, hBmpWindow);
+
+    // КЛЮЧЕВОЙ МОМЕНТ: PW_RENDERFULLCONTENT просит окно отрендерить себя "чисто",
+    // без наложенных сверху DWM-оверлеев.
+    BOOL success = PrintWindow(hwnd, memDCWindow, PW_RENDERFULLCONTENT);
+    
+    if (!success) {
+        // Fallback на обычный BitBlt, если PrintWindow не сработал
+        BitBlt(memDCWindow, 0, 0, width, height, hdcWindow, 0, 0, SRCCOPY);
+        success = TRUE;
+    }
+    
+    if (success) {
+        // Рисуем это "чистое" окно на наш главный холст (g_state.memDC)
+        // С учётом его позиции на виртуальном экране
+        int drawX = rc.left - g_state.screenLeft;
+        int drawY = rc.top - g_state.screenTop;
+        
+        // Проверяем, не выходит ли окно за границы холста
+        if (drawX < 0 || drawY < 0 || drawX >= g_state.screenW || drawY >= g_state.screenH) {
+            SelectObject(memDCWindow, oldBmp);
+            DeleteObject(hBmpWindow);
+            DeleteDC(memDCWindow);
+            ReleaseDC(hwnd, hdcWindow);
+            return;
+        }
+        
+        // Ограничиваем размеры, если окно выходит за границы
+        int drawW = (std::min)(width, g_state.screenW - drawX);
+        int drawH = (std::min)(height, g_state.screenH - drawY);
+        
+        // Используем AlphaBlend для поддержки полупрозрачности
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        AlphaBlend(g_state.memDC, drawX, drawY, drawW, drawH, 
+                   memDCWindow, 0, 0, drawW, drawH, bf);
+    }
+
+    SelectObject(memDCWindow, oldBmp);
+    DeleteObject(hBmpWindow);
+    DeleteDC(memDCWindow);
+    ReleaseDC(hwnd, hdcWindow);
+}
+
+bool CaptureFullScreen() {
     CleanupMem();
     g_state.screenLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
     g_state.screenTop  = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -171,45 +208,29 @@ bool CaptureFullScreenFallback() {
     g_state.screenH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
     HDC screenDC = GetDC(nullptr);
+    if (!screenDC) return false;
+    
     g_state.memDC = CreateCompatibleDC(screenDC);
     g_state.memBmp = CreateCompatibleBitmap(screenDC, g_state.screenW, g_state.screenH);
     g_state.oldBmp = (HBITMAP)SelectObject(g_state.memDC, g_state.memBmp);
 
-    // Пытаемся скрыть известные оверлеи перед захватом (дополнительная защита)
-    HWND hwndOverlay = FindWindowW(L"DiscordOverlay", nullptr);
-    bool wasVisible = hwndOverlay && IsWindowVisible(hwndOverlay);
-    if (wasVisible) ShowWindow(hwndOverlay, SW_HIDE);
+    // 1. Захватываем фон рабочего стола (обои)
+    CaptureDesktopBackground();
 
-    BitBlt(g_state.memDC, 0, 0, g_state.screenW, g_state.screenH,
-           screenDC, g_state.screenLeft, g_state.screenTop, SRCCOPY | CAPTUREBLT);
+    // 2. Собираем все видимые окна (EnumWindows идёт от верхнего к нижнему)
+    std::vector<WindowInfo> windows;
+    EnumWindows(CollectWindows, reinterpret_cast<LPARAM>(&windows));
 
-    if (wasVisible) ShowWindow(hwndOverlay, SW_SHOW); // Восстанавливаем
+    // 3. Переворачиваем список, чтобы рисовать снизу вверх (правильный Z-порядок)
+    std::reverse(windows.begin(), windows.end());
+
+    // 4. Послойно рисуем все окна на холст
+    for (const auto& winInfo : windows) {
+        DrawWindowToCanvas(winInfo);
+    }
 
     ReleaseDC(nullptr, screenDC);
     return g_state.memBmp != nullptr;
-}
-
-bool CaptureFullScreen() {
-    CleanupMem();
-    
-    // Пробуем современный "чистый" метод
-    HBITMAP dxgiBmp = CaptureScreenDXGI(g_state.screenW, g_state.screenH);
-    
-    if (dxgiBmp) {
-        // DXGI успешен. Подготавливаем state так, как это делал старый код
-        g_state.screenLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        g_state.screenTop  = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        
-        HDC screenDC = GetDC(nullptr);
-        g_state.memDC = CreateCompatibleDC(screenDC);
-        g_state.oldBmp = (HBITMAP)SelectObject(g_state.memDC, dxgiBmp);
-        g_state.memBmp = dxgiBmp; // Теперь memBmp указывает на DXGI-битмап
-        ReleaseDC(nullptr, screenDC);
-        return true;
-    }
-
-    // Fallback, если DXGI не поддерживается (редко, но бывает на VM или старых драйверах)
-    return CaptureFullScreenFallback();
 }
 
 // Create a 32-bit ARGB dibsection for layered window
