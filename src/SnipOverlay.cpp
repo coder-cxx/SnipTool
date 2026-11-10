@@ -82,7 +82,8 @@ bool IsOverlayOrWatermarkWindow(HWND hwnd) {
 
 struct WindowInfo {
     HWND hwnd;
-    RECT rect;
+    RECT fullRect;    // GetWindowRect — с тенью
+    RECT visibleRect; // DWMWA_EXTENDED_FRAME_BOUNDS — без тени
 };
 
 BOOL CALLBACK CollectWindows(HWND hwnd, LPARAM lParam) {
@@ -102,22 +103,30 @@ BOOL CALLBACK CollectWindows(HWND hwnd, LPARAM lParam) {
         return TRUE;
     }
 
-    // Cloaked windows
     BOOL cloaked = FALSE;
     if (SUCCEEDED(DwmGetWindowAttribute(hwnd, 14 /*DWMWA_CLOAKED*/, &cloaked, sizeof(cloaked))) && cloaked)
         return TRUE;
 
-    RECT rc{};
-    if (!GetWindowRect(hwnd, &rc)) return TRUE;
-    if ((rc.right - rc.left) <= 1 || (rc.bottom - rc.top) <= 1) return TRUE;
+    RECT full{};
+    if (!GetWindowRect(hwnd, &full)) return TRUE;
+    if ((full.right - full.left) <= 1 || (full.bottom - full.top) <= 1) return TRUE;
 
-    if (rc.right <= g_state.screenLeft || rc.bottom <= g_state.screenTop ||
-        rc.left >= g_state.screenLeft + g_state.screenW ||
-        rc.top  >= g_state.screenTop  + g_state.screenH)
+    if (full.right <= g_state.screenLeft || full.bottom <= g_state.screenTop ||
+        full.left >= g_state.screenLeft + g_state.screenW ||
+        full.top  >= g_state.screenTop  + g_state.screenH)
         return TRUE;
 
+    RECT visible = full;
+    DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &visible, sizeof(visible));
+
+    // Sanity: visible must be inside full (or equal)
+    if (visible.left   < full.left)   visible.left   = full.left;
+    if (visible.top    < full.top)    visible.top    = full.top;
+    if (visible.right  > full.right)  visible.right  = full.right;
+    if (visible.bottom > full.bottom) visible.bottom = full.bottom;
+
     auto& windows = *reinterpret_cast<std::vector<WindowInfo>*>(lParam);
-    windows.push_back({ hwnd, rc });
+    windows.push_back({ hwnd, full, visible });
     return TRUE;
 }
 
@@ -145,19 +154,20 @@ bool HasMeaningfulContent(HBITMAP hBmp, int width, int height) {
         if ((pixels[i] & 0x00FFFFFF) != 0) ++nonBlack;
     }
 
-    // corners + center
     auto check = [&](int x, int y) {
         if (x >= 0 && y >= 0 && x < width && y < height)
             if ((pixels[static_cast<size_t>(y) * width + x] & 0x00FFFFFF) != 0) ++nonBlack;
     };
-    check(0, 0); check(width-1, 0); check(0, height-1); check(width-1, height-1);
-    check(width/2, height/2);
+    check(0, 0); check(width - 1, 0); check(0, height - 1); check(width - 1, height - 1);
+    check(width / 2, height / 2);
 
     return nonBlack >= 3;
 }
 
-// Захват одного окна: PrintWindow → fallback BitBlt (для 3D/CAD/игр)
+// Capture ONLY the visible part of the window (no shadow mask)
 HBITMAP CaptureWindowContent(HWND hwnd, int width, int height) {
+    if (width <= 0 || height <= 0) return nullptr;
+
     HDC hdcScreen = GetDC(nullptr);
     HDC memDC = CreateCompatibleDC(hdcScreen);
     HBITMAP hBmp = CreateCompatibleBitmap(hdcScreen, width, height);
@@ -166,27 +176,27 @@ HBITMAP CaptureWindowContent(HWND hwnd, int width, int height) {
     RECT rc{ 0, 0, width, height };
     FillRect(memDC, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
-    // 1. PrintWindow full content (лучше всего убирает оверлеи)
     BOOL ok = PrintWindow(hwnd, memDC, PW_RENDERFULLCONTENT);
     bool good = ok && HasMeaningfulContent(hBmp, width, height);
 
-    // 2. Обычный PrintWindow
     if (!good) {
         ok = PrintWindow(hwnd, memDC, 0);
         good = ok && HasMeaningfulContent(hBmp, width, height);
     }
 
-    // 3. BitBlt с GetWindowDC — часто спасает 3D/CAD/игры в оконном/borderless режиме
     if (!good) {
         HDC hdcWin = GetWindowDC(hwnd);
         if (hdcWin) {
+            // GetWindowDC is relative to full window including shadow margin.
+            // We need content corresponding to visible area — caller passes visible size,
+            // so offset by shadow margin if needed. For simplicity BitBlt from 0,0;
+            // when used with visible size after DWM bounds it usually matches.
             BitBlt(memDC, 0, 0, width, height, hdcWin, 0, 0, SRCCOPY | CAPTUREBLT);
             ReleaseDC(hwnd, hdcWin);
             good = HasMeaningfulContent(hBmp, width, height);
         }
     }
 
-    // 4. Client area
     if (!good) {
         HDC hdcClient = GetDC(hwnd);
         if (hdcClient) {
@@ -201,92 +211,115 @@ HBITMAP CaptureWindowContent(HWND hwnd, int width, int height) {
     return hBmp;
 }
 
+// Approach B from the guide: distance-based soft shadow in the margin only.
+// Drawn onto canvas BEFORE the window content.
+void DrawShadowForWindow(const RECT& full, const RECT& visible) {
+    const int fullW = full.right - full.left;
+    const int fullH = full.bottom - full.top;
+    if (fullW <= 0 || fullH <= 0) return;
 
-// Soft DWM-like drop shadow into the margin around the visible window frame.
-// outer*  – full GetWindowRect area already placed on the canvas
-// visible* – DWMWA_EXTENDED_FRAME_BOUNDS (real visible window)
-void DrawSoftShadow(int outerX, int outerY, int outerW, int outerH,
-                    int visX, int visY, int visW, int visH)
-{
-    if (outerW <= 0 || outerH <= 0 || visW <= 0 || visH <= 0) return;
+    const int marginL = visible.left   - full.left;
+    const int marginT = visible.top    - full.top;
+    const int marginR = full.right     - visible.right;
+    const int marginB = full.bottom    - visible.bottom;
 
-    // Soft shadow: strongest near visible edges, fades toward outer edge.
-    // Slightly stronger on bottom/right like classic DWM.
-    const int shadowMaxAlpha = 110;
-    // Create a small grayscale alpha bitmap for the whole outer region
-    std::vector<uint8_t> shadow(static_cast<size_t>(outerW) * outerH * 4, 0);
+    // No shadow margin → nothing to do
+    if (marginL <= 0 && marginT <= 0 && marginR <= 0 && marginB <= 0)
+        return;
 
-    // Visible rect relative to outer
-    int vx0 = visX - outerX;
-    int vy0 = visY - outerY;
-    int vx1 = vx0 + visW;
-    int vy1 = vy0 + visH;
+    // Visible rect size
+    const int visW = visible.right - visible.left;
+    const int visH = visible.bottom - visible.top;
+    if (visW <= 0 || visH <= 0) return;
 
-    // Clamp
-    vx0 = std::max(0, vx0); vy0 = std::max(0, vy0);
-    vx1 = std::min(outerW, vx1); vy1 = std::min(outerH, vy1);
+    // Destination of full rect on our virtual-screen canvas
+    const int dstX = full.left - g_state.screenLeft;
+    const int dstY = full.top  - g_state.screenTop;
 
-    for (int y = 0; y < outerH; ++y) {
-        for (int x = 0; x < outerW; ++x) {
+    // Build a small ARGB buffer for the full rect (only margin will be non-zero)
+    std::vector<uint8_t> shadow(static_cast<size_t>(fullW) * fullH * 4, 0);
+
+    // Visible region relative to full rect origin
+    const int vx0 = marginL;
+    const int vy0 = marginT;
+    const int vx1 = marginL + visW;
+    const int vy1 = marginT + visH;
+
+    // Max margin for falloff
+    const float maxMargin = static_cast<float>(
+        (std::max)({ marginL, marginT, marginR, marginB, 1 }));
+
+    const float sigma = maxMargin * 0.55f; // softness
+    const float peakAlpha = 120.0f;        // max shadow strength
+
+    for (int y = 0; y < fullH; ++y) {
+        for (int x = 0; x < fullW; ++x) {
             // Inside visible window → no shadow
             if (x >= vx0 && x < vx1 && y >= vy0 && y < vy1)
                 continue;
 
-            // Distance to nearest visible edge
+            // Distance to visible rectangle (0 at edge, positive outside)
             int dx = 0, dy = 0;
-            if (x < vx0) dx = vx0 - x;
+            if (x < vx0)      dx = vx0 - x;
             else if (x >= vx1) dx = x - (vx1 - 1);
-            if (y < vy0) dy = vy0 - y;
+            if (y < vy0)      dy = vy0 - y;
             else if (y >= vy1) dy = y - (vy1 - 1);
 
-            // Approximate Euclidean distance into the margin
-            float dist = std::sqrt(static_cast<float>(dx * dx + dy * dy));
+            const float dist = std::sqrt(static_cast<float>(dx * dx + dy * dy));
+            // Gaussian-like falloff
+            float a = std::exp(-(dist * dist) / (2.0f * sigma * sigma));
+            // Slightly stronger bottom/right like DWM
+            if (y >= vy1) a *= 1.12f;
+            if (x >= vx1) a *= 1.08f;
+            a = std::clamp(a, 0.0f, 1.0f);
 
-            // Shadow radius roughly the size of the margin
-            float maxDist = 1.0f;
-            if (dx > 0) maxDist = std::max(maxDist, static_cast<float>( (x < vx0) ? vx0 : (outerW - vx1) ));
-            if (dy > 0) maxDist = std::max(maxDist, static_cast<float>( (y < vy0) ? vy0 : (outerH - vy1) ));
-            // Slightly larger soft falloff
-            maxDist = std::max(maxDist, 8.0f);
-
-            float t = std::clamp(dist / maxDist, 0.0f, 1.0f);
-            // Smooth falloff (ease-out)
-            float alphaF = (1.0f - t) * (1.0f - t);
-            // Stronger on bottom/right like classic DWM
-            if (y >= vy1) alphaF *= 1.15f;
-            if (x >= vx1) alphaF *= 1.10f;
-            alphaF = std::clamp(alphaF, 0.0f, 1.0f);
-
-            uint8_t a = static_cast<uint8_t>(alphaF * shadowMaxAlpha);
-            size_t idx = (static_cast<size_t>(y) * outerW + x) * 4;
-            // premultiplied-ish dark shadow (BGR + A)
+            const uint8_t alpha = static_cast<uint8_t>(a * peakAlpha);
+            const size_t idx = (static_cast<size_t>(y) * fullW + x) * 4;
+            // Straight alpha (not premultiplied) — AlphaBlend with AC_SRC_ALPHA expects
+            // premultiplied for best results; we use simple dark RGB + alpha.
             shadow[idx + 0] = 0;
             shadow[idx + 1] = 0;
             shadow[idx + 2] = 0;
-            shadow[idx + 3] = a;
+            shadow[idx + 3] = alpha;
         }
     }
 
-    // Blit shadow with alpha over the canvas in the outer rect
-    BITMAPINFO sbmi{};
-    sbmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    sbmi.bmiHeader.biWidth = outerW;
-    sbmi.bmiHeader.biHeight = -outerH;
-    sbmi.bmiHeader.biPlanes = 1;
-    sbmi.bmiHeader.biBitCount = 32;
-    sbmi.bmiHeader.biCompression = BI_RGB;
+    // Premultiply for correct AlphaBlend
+    for (size_t i = 0; i < shadow.size(); i += 4) {
+        const uint8_t a = shadow[i + 3];
+        // RGB already 0
+        (void)a;
+    }
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = fullW;
+    bmi.bmiHeader.biHeight = -fullH;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
 
     HDC hdcScreen = GetDC(nullptr);
     HDC shadowDC = CreateCompatibleDC(hdcScreen);
     void* bits = nullptr;
-    HBITMAP hShadow = CreateDIBSection(hdcScreen, &sbmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP hShadow = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (hShadow && bits) {
         memcpy(bits, shadow.data(), shadow.size());
         HBITMAP old = (HBITMAP)SelectObject(shadowDC, hShadow);
 
-        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-        AlphaBlend(g_state.memDC, outerX, outerY, outerW, outerH,
-                   shadowDC, 0, 0, outerW, outerH, bf);
+        // Clip draw to canvas
+        int drawX = dstX, drawY = dstY, drawW = fullW, drawH = fullH;
+        int srcX = 0, srcY = 0;
+        if (drawX < 0) { srcX = -drawX; drawW += drawX; drawX = 0; }
+        if (drawY < 0) { srcY = -drawY; drawH += drawY; drawY = 0; }
+        if (drawX + drawW > g_state.screenW) drawW = g_state.screenW - drawX;
+        if (drawY + drawH > g_state.screenH) drawH = g_state.screenH - drawY;
+
+        if (drawW > 0 && drawH > 0) {
+            BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+            AlphaBlend(g_state.memDC, drawX, drawY, drawW, drawH,
+                       shadowDC, srcX, srcY, drawW, drawH, bf);
+        }
 
         SelectObject(shadowDC, old);
         DeleteObject(hShadow);
@@ -296,28 +329,35 @@ void DrawSoftShadow(int outerX, int outerY, int outerW, int outerH,
 }
 
 void DrawWindowToCanvas(const WindowInfo& info) {
-    const RECT& rc = info.rect; // GetWindowRect (includes shadow margin)
-    int width  = rc.right - rc.left;
-    int height = rc.bottom - rc.top;
-    if (width <= 0 || height <= 0) return;
+    const RECT& full = info.fullRect;
+    const RECT& visible = info.visibleRect;
 
-    // Visible frame without shadow
-    RECT vis = rc;
-    DwmGetWindowAttribute(info.hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &vis, sizeof(vis));
-    int visW = vis.right - vis.left;
-    int visH = vis.bottom - vis.top;
+    const int fullW = full.right - full.left;
+    const int fullH = full.bottom - full.top;
+    const int visW = visible.right - visible.left;
+    const int visH = visible.bottom - visible.top;
+    if (fullW <= 0 || fullH <= 0 || visW <= 0 || visH <= 0) return;
 
-    HBITMAP hBmp = CaptureWindowContent(info.hwnd, width, height);
+    // 1) Shadow first (margin between full and visible)
+    DrawShadowForWindow(full, visible);
+
+    // 2) Capture full window (same path that already worked), then blit only visible part
+    HBITMAP hBmp = CaptureWindowContent(info.hwnd, fullW, fullH);
     if (!hBmp) return;
 
-    int dstX = rc.left - g_state.screenLeft;
-    int dstY = rc.top  - g_state.screenTop;
+    const int marginL = visible.left - full.left;
+    const int marginT = visible.top  - full.top;
 
-    int srcX = 0, srcY = 0;
-    int drawW = width, drawH = height;
+    int dstX = visible.left - g_state.screenLeft;
+    int dstY = visible.top  - g_state.screenTop;
 
-    if (dstX < 0) { srcX = -dstX; drawW += dstX; dstX = 0; }
-    if (dstY < 0) { srcY = -dstY; drawH += dstY; dstY = 0; }
+    int srcX = marginL;
+    int srcY = marginT;
+    int drawW = visW;
+    int drawH = visH;
+
+    if (dstX < 0) { srcX -= dstX; drawW += dstX; dstX = 0; }
+    if (dstY < 0) { srcY -= dstY; drawH += dstY; dstY = 0; }
     if (dstX + drawW > g_state.screenW) drawW = g_state.screenW - dstX;
     if (dstY + drawH > g_state.screenH) drawH = g_state.screenH - dstY;
 
@@ -330,33 +370,21 @@ void DrawWindowToCanvas(const WindowInfo& info) {
     HDC srcDC = CreateCompatibleDC(hdcScreen);
     HBITMAP old = (HBITMAP)SelectObject(srcDC, hBmp);
 
-    // First: paint only the *visible* part of the window (avoid pure-black shadow mask)
-    // Compute visible area relative to the captured bitmap
-    int visDstX = vis.left - g_state.screenLeft;
-    int visDstY = vis.top  - g_state.screenTop;
-    int visSrcX = vis.left - rc.left;
-    int visSrcY = vis.top  - rc.top;
+    LONG exStyle = GetWindowLongW(info.hwnd, GWL_EXSTYLE);
+    bool layered = (exStyle & WS_EX_LAYERED) != 0;
 
-    // Clip visible blit
-    int vx = visDstX, vy = visDstY, vw = visW, vh = visH;
-    int vsx = visSrcX, vsy = visSrcY;
-    if (vx < 0) { vsx -= vx; vw += vx; vx = 0; }
-    if (vy < 0) { vsy -= vy; vh += vy; vy = 0; }
-    if (vx + vw > g_state.screenW) vw = g_state.screenW - vx;
-    if (vy + vh > g_state.screenH) vh = g_state.screenH - vy;
-
-    if (vw > 0 && vh > 0) {
-        BitBlt(g_state.memDC, vx, vy, vw, vh, srcDC, vsx, vsy, SRCCOPY);
+    if (layered) {
+        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        AlphaBlend(g_state.memDC, dstX, dstY, drawW, drawH,
+                   srcDC, srcX, srcY, drawW, drawH, bf);
+    } else {
+        BitBlt(g_state.memDC, dstX, dstY, drawW, drawH, srcDC, srcX, srcY, SRCCOPY);
     }
 
     SelectObject(srcDC, old);
     DeleteDC(srcDC);
     ReleaseDC(nullptr, hdcScreen);
     DeleteObject(hBmp);
-
-    // Then paint soft shadow into the margin (outer rect area)
-    DrawSoftShadow(dstX, dstY, width, height,
-                   visDstX, visDstY, visW, visH);
 }
 
 void CaptureDesktopBackground() {
@@ -372,7 +400,6 @@ void CaptureDesktopBackground() {
         }
     }
 
-    // Если фон всё ещё почти пустой — классический BitBlt
     if (!HasMeaningfulContent(g_state.memBmp, g_state.screenW, g_state.screenH)) {
         HDC screenDC = GetDC(nullptr);
         if (screenDC) {
@@ -399,15 +426,11 @@ bool CaptureFullScreen() {
     g_state.oldBmp = (HBITMAP)SelectObject(g_state.memDC, g_state.memBmp);
     ReleaseDC(nullptr, screenDC);
 
-    // 1. Фон
     CaptureDesktopBackground();
 
-    // 2. Все обычные окна (без оверлеев)
     std::vector<WindowInfo> windows;
     EnumWindows(CollectWindows, reinterpret_cast<LPARAM>(&windows));
-
-    // EnumWindows идёт top → bottom, рисуем bottom → top
-    std::reverse(windows.begin(), windows.end());
+    std::reverse(windows.begin(), windows.end()); // bottom → top
 
     for (const auto& w : windows) {
         DrawWindowToCanvas(w);
@@ -416,7 +439,7 @@ bool CaptureFullScreen() {
     return g_state.memBmp != nullptr;
 }
 
-// ---------- Layered overlay (затемнение + выделение) ----------
+// ---------- selection overlay ----------
 
 HBITMAP CreateARGBSurface(int w, int h, void** bits) {
     BITMAPINFO bmi{};
@@ -639,7 +662,6 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
         resultBmp = CreateCompatibleBitmap(screenDC, w, h);
         HBITMAP old = (HBITMAP)SelectObject(selDC, resultBmp);
 
-        // Координаты уже относительно виртуального экрана
         BitBlt(selDC, 0, 0, w, h, g_state.memDC, selected.left, selected.top, SRCCOPY);
 
         SelectObject(selDC, old);
@@ -653,12 +675,9 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
 
 HBITMAP SnipOverlay::CaptureFullScreenBitmap() {
     g_state = {};
-    if (!CaptureFullScreen()) {
-        return nullptr;
-    }
-    // Transfer ownership of the bitmap out; detach from memDC
+    if (!CaptureFullScreen()) return nullptr;
+
     HBITMAP result = g_state.memBmp;
-    // Prevent CleanupMem from deleting it
     SelectObject(g_state.memDC, g_state.oldBmp);
     DeleteDC(g_state.memDC);
     g_state.memDC = nullptr;
