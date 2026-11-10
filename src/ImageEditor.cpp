@@ -5,6 +5,7 @@
 #include <commdlg.h>
 #include <vector>
 #include <algorithm>
+#include <cstdint>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -14,8 +15,15 @@ namespace {
 constexpr int TOOLBAR_H = 40;
 constexpr int BTN_W = 90;
 constexpr int BTN_H = 28;
+constexpr int MARGIN_X = 8;
+constexpr int MARGIN_Y_TOP = 6;
+constexpr int IMAGE_OFFSET_X = 8;
+constexpr int IMAGE_OFFSET_Y = TOOLBAR_H + 8;
 
-// Helper: get DIB bits for PNG / clipboard
+// FIX: Минимальные размеры окна, чтобы влезала вся панель инструментов
+constexpr int MIN_WIN_W = 760; 
+constexpr int MIN_WIN_H = 200;
+
 bool GetBitmapData(HBITMAP hBmp, int& w, int& h, std::vector<uint8_t>& pixelsBGRA) {
     BITMAP bm{};
     if (!GetObject(hBmp, sizeof(bm), &bm)) return false;
@@ -24,7 +32,7 @@ bool GetBitmapData(HBITMAP hBmp, int& w, int& h, std::vector<uint8_t>& pixelsBGR
 
     BITMAPINFOHEADER bi{ sizeof(bi) };
     bi.biWidth = w;
-    bi.biHeight = -h; // top-down
+    bi.biHeight = -h;
     bi.biPlanes = 1;
     bi.biBitCount = 32;
     bi.biCompression = BI_RGB;
@@ -36,7 +44,24 @@ bool GetBitmapData(HBITMAP hBmp, int& w, int& h, std::vector<uint8_t>& pixelsBGR
     return res != 0;
 }
 
+POINT GetImagePoint(LPARAM lParam) {
+    POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    pt.x -= IMAGE_OFFSET_X;
+    pt.y -= IMAGE_OFFSET_Y;
+    return pt;
+}
+
 } // namespace
+
+// Инициализация статического массива цветов палитры
+constexpr COLORREF ImageEditor::paletteColors_[6] = {
+    RGB(255, 0, 0),    // Red
+    RGB(0, 255, 0),    // Green
+    RGB(0, 0, 255),    // Blue
+    RGB(255, 255, 0),  // Yellow
+    RGB(0, 0, 0),      // Black
+    RGB(255, 255, 255) // White
+};
 
 ImageEditor::ImageEditor(HINSTANCE hInstance, HBITMAP hSourceBmp, const RECT& screenRect)
     : hInst_(hInstance), screenRect_(screenRect)
@@ -46,7 +71,6 @@ ImageEditor::ImageEditor(HINSTANCE hInstance, HBITMAP hSourceBmp, const RECT& sc
     imgW_ = bm.bmWidth;
     imgH_ = bm.bmHeight;
 
-    // Copy source into our original
     HDC screenDC = GetDC(nullptr);
     HDC srcDC = CreateCompatibleDC(screenDC);
     HBITMAP oldSrc = (HBITMAP)SelectObject(srcDC, hSourceBmp);
@@ -62,12 +86,10 @@ ImageEditor::ImageEditor(HINSTANCE hInstance, HBITMAP hSourceBmp, const RECT& sc
     DeleteDC(srcDC);
     ReleaseDC(nullptr, screenDC);
 
-    // Create canvas
-    HDC screenDC2 = GetDC(nullptr);
-    hdcCanvas_ = CreateCompatibleDC(screenDC2);
-    hCanvas_ = CreateCompatibleBitmap(screenDC2, imgW_, imgH_);
-    ReleaseDC(nullptr, screenDC2);
+    hdcCanvas_ = CreateCompatibleDC(nullptr);
+    hCanvas_ = CreateCompatibleBitmap(screenDC, imgW_, imgH_);
     hOldCanvas_ = (HBITMAP)SelectObject(hdcCanvas_, hCanvas_);
+    
     RebuildCanvas();
 }
 
@@ -81,14 +103,12 @@ ImageEditor::~ImageEditor() {
 }
 
 void ImageEditor::RebuildCanvas() {
-    // Start from original
     HDC srcDC = CreateCompatibleDC(hdcCanvas_);
     HBITMAP old = (HBITMAP)SelectObject(srcDC, hOriginal_);
     BitBlt(hdcCanvas_, 0, 0, imgW_, imgH_, srcDC, 0, 0, SRCCOPY);
     SelectObject(srcDC, old);
     DeleteDC(srcDC);
 
-    // Replay all strokes
     for (const auto& s : strokes_) {
         HPEN pen = CreatePen(PS_SOLID, s.thickness, s.color);
         HPEN oldPen = (HPEN)SelectObject(hdcCanvas_, pen);
@@ -105,9 +125,7 @@ void ImageEditor::RebuildCanvas() {
             LineTo(hdcCanvas_, s.points[1].x, s.points[1].y);
         }
         else if (s.tool == Tool::Rectangle && s.points.size() == 2) {
-            Rectangle(hdcCanvas_,
-                s.points[0].x, s.points[0].y,
-                s.points[1].x, s.points[1].y);
+            Rectangle(hdcCanvas_, s.points[0].x, s.points[0].y, s.points[1].x, s.points[1].y);
         }
 
         SelectObject(hdcCanvas_, oldBrush);
@@ -117,46 +135,77 @@ void ImageEditor::RebuildCanvas() {
 }
 
 void ImageEditor::CreateControls() {
-    // Simple buttons in toolbar area
     auto makeBtn = [&](const wchar_t* text, int x, int id) -> HWND {
-        return CreateWindowW(L"BUTTON", text,
+        HWND hwnd = CreateWindowW(L"BUTTON", text,
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            x, 6, BTN_W, BTN_H,
+            x, MARGIN_Y_TOP, BTN_W, BTN_H,
             hwnd_, (HMENU)(INT_PTR)id, hInst_, nullptr);
+        SendMessageW(hwnd, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+        return hwnd;
     };
 
-    btnFree_  = makeBtn(L"Pencil",   8, 1001);
-    btnLine_  = makeBtn(L"Line",     8 + BTN_W + 6, 1002);
-    btnRect_  = makeBtn(L"Rect",     8 + 2*(BTN_W + 6), 1003);
-    btnColor_ = makeBtn(L"Color",    8 + 3*(BTN_W + 6), 1004);
-    btnUndo_  = makeBtn(L"Undo",     8 + 4*(BTN_W + 6), 1005);
-    btnCopy_  = makeBtn(L"Copy",     8 + 5*(BTN_W + 6), 1006);
-    btnSave_  = makeBtn(L"Save PNG", 8 + 6*(BTN_W + 6), 1007);
+    btnFree_  = makeBtn(L"Pencil",   MARGIN_X, 1001);
+    btnLine_  = makeBtn(L"Line",     MARGIN_X + 1 * (BTN_W + 6), 1002);
+    btnRect_  = makeBtn(L"Rect",     MARGIN_X + 2 * (BTN_W + 6), 1003);
+    btnColor_ = makeBtn(L"More...",  MARGIN_X + 3 * (BTN_W + 6), 1004); // Переименовали для ясности
+    btnUndo_  = makeBtn(L"Undo",     MARGIN_X + 4 * (BTN_W + 6), 1005);
+    btnCopy_  = makeBtn(L"Copy",     MARGIN_X + 5 * (BTN_W + 6), 1006);
+    btnSave_  = makeBtn(L"Save PNG", MARGIN_X + 6 * (BTN_W + 6), 1007);
 
     UpdateToolButtons();
 }
 
 void ImageEditor::UpdateToolButtons() {
-    // Simple visual feedback via button text or we can use check state later
-    // For now just leave as is; user knows current by last click
+    SetWindowTextW(btnFree_,  (currentTool_ == Tool::Freehand)  ? L"[Pencil]" : L"Pencil");
+    SetWindowTextW(btnLine_,  (currentTool_ == Tool::Line)      ? L"[Line]"   : L"Line");
+    SetWindowTextW(btnRect_,  (currentTool_ == Tool::Rectangle) ? L"[Rect]"   : L"Rect");
 }
 
 void ImageEditor::OnPaint(HDC hdc) {
-    // Fill toolbar background
     RECT rcToolbar{ 0, 0, imgW_ + 16, TOOLBAR_H };
     FillRect(hdc, &rcToolbar, (HBRUSH)(COLOR_BTNFACE + 1));
 
-    // Draw the canvas below toolbar
-    BitBlt(hdc, 8, TOOLBAR_H + 8, imgW_, imgH_, hdcCanvas_, 0, 0, SRCCOPY);
+    BitBlt(hdc, IMAGE_OFFSET_X, IMAGE_OFFSET_Y, imgW_, imgH_, hdcCanvas_, 0, 0, SRCCOPY);
 
-    // Border around image
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(100, 100, 100));
-    HPEN old = (HPEN)SelectObject(hdc, pen);
-    HBRUSH oldB = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    Rectangle(hdc, 7, TOOLBAR_H + 7, 9 + imgW_, TOOLBAR_H + 9 + imgH_);
-    SelectObject(hdc, oldB);
-    SelectObject(hdc, old);
-    DeleteObject(pen);
+    // FIX: Отрисовка палитры быстрых цветов
+    int px = MARGIN_X + PALETTE_BTN_OFFSET * (BTN_W + 6);
+    int py = MARGIN_Y_TOP;
+    for (int i = 0; i < 6; ++i) {
+        RECT rc{ px + i * 28, py, px + i * 28 + 24, py + 24 };
+        
+        // Заливка цветом
+        HBRUSH hBrush = CreateSolidBrush(paletteColors_[i]);
+        FillRect(hdc, &rc, hBrush);
+        DeleteObject(hBrush);
+
+        // Рамка
+        HPEN pen = CreatePen(PS_SOLID, 1, RGB(150, 150, 150));
+        HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+        HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+
+        // Подсветка активного цвета
+        if (currentColor_ == paletteColors_[i]) {
+            HPEN selPen = CreatePen(PS_SOLID, 2, RGB(0, 120, 215));
+            HPEN oldSel = (HPEN)SelectObject(hdc, selPen);
+            SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            Rectangle(hdc, rc.left - 2, rc.top - 2, rc.right + 2, rc.bottom + 2);
+            SelectObject(hdc, oldSel);
+            DeleteObject(selPen);
+        }
+    }
+
+    // Рамка вокруг изображения
+    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(100, 100, 100));
+    HPEN oldBp = (HPEN)SelectObject(hdc, borderPen);
+    HBRUSH oldBb = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, IMAGE_OFFSET_X - 1, IMAGE_OFFSET_Y - 1, IMAGE_OFFSET_X + imgW_ + 1, IMAGE_OFFSET_Y + imgH_ + 1);
+    SelectObject(hdc, oldBb);
+    SelectObject(hdc, oldBp);
+    DeleteObject(borderPen);
 }
 
 void ImageEditor::StartStroke(POINT pt) {
@@ -173,7 +222,6 @@ void ImageEditor::ContinueStroke(POINT pt) {
     if (!drawing_) return;
 
     if (currentTool_ == Tool::Freehand) {
-        // Draw immediately for freehand
         HPEN pen = CreatePen(PS_SOLID, thickness_, currentColor_);
         HPEN old = (HPEN)SelectObject(hdcCanvas_, pen);
         MoveToEx(hdcCanvas_, lastPt_.x, lastPt_.y, nullptr);
@@ -184,12 +232,10 @@ void ImageEditor::ContinueStroke(POINT pt) {
         currentStroke_.points.push_back(pt);
         lastPt_ = pt;
 
-        // Invalidate only image area
-        RECT inv{ 8, TOOLBAR_H + 8, 8 + imgW_, TOOLBAR_H + 8 + imgH_ };
+        RECT inv{ IMAGE_OFFSET_X, IMAGE_OFFSET_Y, IMAGE_OFFSET_X + imgW_, IMAGE_OFFSET_Y + imgH_ };
         InvalidateRect(hwnd_, &inv, FALSE);
     }
     else {
-        // For line/rect we just update preview point and full redraw on paint
         lastPt_ = pt;
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
@@ -209,17 +255,17 @@ void ImageEditor::EndStroke(POINT pt) {
         currentStroke_.points.push_back(startPt_);
         currentStroke_.points.push_back(pt);
         strokes_.push_back(std::move(currentStroke_));
-        RebuildCanvas(); // commit
     }
+    
+    RebuildCanvas();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-void ImageEditor::CopyToClipboard() {
+// FIX: Добавлен параметр showNotification
+void ImageEditor::CopyToClipboard(bool showNotification) {
     if (!OpenClipboard(hwnd_)) return;
     EmptyClipboard();
 
-    // Put CF_BITMAP
-    // We need a clean copy of the canvas
     HDC screenDC = GetDC(nullptr);
     HDC tmpDC = CreateCompatibleDC(screenDC);
     HBITMAP hCopy = CreateCompatibleBitmap(screenDC, imgW_, imgH_);
@@ -229,10 +275,37 @@ void ImageEditor::CopyToClipboard() {
     DeleteDC(tmpDC);
     ReleaseDC(nullptr, screenDC);
 
-    SetClipboardData(CF_BITMAP, hCopy); // system owns it now
+    SetClipboardData(CF_BITMAP, hCopy);
+    
+    // Поддержка CF_DIB для современных приложений
+    int w = 0, h = 0;
+    std::vector<uint8_t> bgra;
+    if (GetBitmapData(hCopy, w, h, bgra)) {
+        size_t dibSize = sizeof(BITMAPV5HEADER) + w * h * 4;
+        HGLOBAL hDIB = GlobalAlloc(GMEM_MOVEABLE, dibSize);
+        if (hDIB) {
+            auto* pDIB = reinterpret_cast<BITMAPV5HEADER*>(GlobalLock(hDIB));
+            pDIB->bV5Size = sizeof(BITMAPV5HEADER);
+            pDIB->bV5Width = w;
+            pDIB->bV5Height = -h;
+            pDIB->bV5Planes = 1;
+            pDIB->bV5BitCount = 32;
+            pDIB->bV5Compression = BI_RGB;
+            pDIB->bV5SizeImage = w * h * 4;
+            
+            uint8_t* pixelsDest = reinterpret_cast<uint8_t*>(pDIB) + sizeof(BITMAPV5HEADER);
+            memcpy(pixelsDest, bgra.data(), w * h * 4);
+            
+            GlobalUnlock(hDIB);
+            SetClipboardData(CF_DIB, hDIB);
+        }
+    }
+
     CloseClipboard();
 
-    MessageBoxW(hwnd_, L"Copied to clipboard", L"SnipTool", MB_OK | MB_ICONINFORMATION);
+    if (showNotification) {
+        MessageBoxW(hwnd_, L"Copied to clipboard", L"SnipTool", MB_OK | MB_ICONINFORMATION);
+    }
 }
 
 void ImageEditor::SaveToFile() {
@@ -254,31 +327,23 @@ void ImageEditor::SaveToFile() {
         return;
     }
 
-    // Convert BGRA → RGBA for stb
     std::vector<uint8_t> rgba(w * h * 4);
     for (int i = 0; i < w * h; ++i) {
-        rgba[i * 4 + 0] = bgra[i * 4 + 2]; // R
-        rgba[i * 4 + 1] = bgra[i * 4 + 1]; // G
-        rgba[i * 4 + 2] = bgra[i * 4 + 0]; // B
-        rgba[i * 4 + 3] = 255;              // A
+        rgba[i * 4 + 0] = bgra[i * 4 + 2];
+        rgba[i * 4 + 1] = bgra[i * 4 + 1];
+        rgba[i * 4 + 2] = bgra[i * 4 + 0];
+        rgba[i * 4 + 3] = 255;
     }
 
-    // Convert wide path to UTF-8
     char pathUtf8[MAX_PATH * 4];
     WideCharToMultiByte(CP_UTF8, 0, path, -1, pathUtf8, sizeof(pathUtf8), nullptr, nullptr);
 
-    std::wstring ext = path;
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
-    bool isBmp = ext.size() >= 4 && ext.substr(ext.size() - 4) == L".bmp";
+    std::wstring wpath(path);
+    std::transform(wpath.begin(), wpath.end(), wpath.begin(), ::towlower);
+    bool isBmp = (wpath.length() >= 4) && (wpath.compare(wpath.length() - 4, 4, L".bmp") == 0);
 
-    int ok = 0;
-    if (isBmp) {
-        // Simple BMP write via WinAPI would be longer; use stb for both
-        // stb can write BMP too
-        ok = stbi_write_bmp(pathUtf8, w, h, 4, rgba.data());
-    } else {
-        ok = stbi_write_png(pathUtf8, w, h, 4, rgba.data(), w * 4);
-    }
+    int ok = isBmp ? stbi_write_bmp(pathUtf8, w, h, 4, rgba.data()) 
+                   : stbi_write_png(pathUtf8, w, h, 4, rgba.data(), w * 4);
 
     if (ok) {
         MessageBoxW(hwnd_, L"Saved successfully", L"SnipTool", MB_OK | MB_ICONINFORMATION);
@@ -319,17 +384,36 @@ LRESULT ImageEditor::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
         case 1005: Undo(); break;
-        case 1006: CopyToClipboard(); break;
+        case 1006: CopyToClipboard(true); break; // FIX: Показываем уведомление при ручном нажатии
         case 1007: SaveToFile(); break;
         }
+        UpdateToolButtons();
+        InvalidateRect(hwnd_, nullptr, FALSE); // Перерисовать палитру при смене цвета
         return 0;
     }
 
     case WM_LBUTTONDOWN: {
-        int x = GET_X_LPARAM(lParam) - 8;
-        int y = GET_Y_LPARAM(lParam) - (TOOLBAR_H + 8);
-        if (x >= 0 && y >= 0 && x < imgW_ && y < imgH_) {
-            StartStroke({ x, y });
+        // FIX: Обработка клика по палитре цветов
+        int mx = GET_X_LPARAM(lParam);
+        int my = GET_Y_LPARAM(lParam);
+        int px = MARGIN_X + PALETTE_BTN_OFFSET * (BTN_W + 6);
+        int py = MARGIN_Y_TOP;
+        
+        if (my >= py && my <= py + 24) {
+            for (int i = 0; i < 6; ++i) {
+                if (mx >= px + i * 28 && mx <= px + i * 28 + 24) {
+                    currentColor_ = paletteColors_[i];
+                    RECT inv{ 0, 0, imgW_ + 16, TOOLBAR_H };
+                    InvalidateRect(hwnd_, &inv, FALSE);
+                    return 0; // Прерываем, чтобы не начать рисовать
+                }
+            }
+        }
+
+        // Стандартная логика начала рисования
+        POINT pt = GetImagePoint(lParam);
+        if (pt.x >= 0 && pt.y >= 0 && pt.x < imgW_ && pt.y < imgH_) {
+            StartStroke(pt);
             SetCapture(hwnd_);
         }
         return 0;
@@ -337,23 +421,20 @@ LRESULT ImageEditor::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_MOUSEMOVE: {
         if (drawing_) {
-            int x = GET_X_LPARAM(lParam) - 8;
-            int y = GET_Y_LPARAM(lParam) - (TOOLBAR_H + 8);
-            // clamp
-            x = std::max(0, std::min(imgW_ - 1, x));
-            y = std::max(0, std::min(imgH_ - 1, y));
-            ContinueStroke({ x, y });
+            POINT pt = GetImagePoint(lParam);
+            pt.x = std::max(0, std::min(imgW_ - 1, pt.x));
+            pt.y = std::max(0, std::min(imgH_ - 1, pt.y));
+            ContinueStroke(pt);
         }
         return 0;
     }
 
     case WM_LBUTTONUP: {
         if (drawing_) {
-            int x = GET_X_LPARAM(lParam) - 8;
-            int y = GET_Y_LPARAM(lParam) - (TOOLBAR_H + 8);
-            x = std::max(0, std::min(imgW_ - 1, x));
-            y = std::max(0, std::min(imgH_ - 1, y));
-            EndStroke({ x, y });
+            POINT pt = GetImagePoint(lParam);
+            pt.x = std::max(0, std::min(imgW_ - 1, pt.x));
+            pt.y = std::max(0, std::min(imgH_ - 1, pt.y));
+            EndStroke(pt);
             ReleaseCapture();
         }
         return 0;
@@ -363,32 +444,27 @@ LRESULT ImageEditor::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd_, &ps);
 
-        // Double-buffer the whole client
         RECT rc;
         GetClientRect(hwnd_, &rc);
         HDC memDC = CreateCompatibleDC(hdc);
         HBITMAP memBmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
         HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
 
-        // Background
         FillRect(memDC, &rc, (HBRUSH)(COLOR_WINDOW + 1));
-
         OnPaint(memDC);
 
-        // Preview of current line/rect while drawing
         if (drawing_ && (currentTool_ == Tool::Line || currentTool_ == Tool::Rectangle)) {
             HPEN pen = CreatePen(PS_SOLID, thickness_, currentColor_);
             HPEN oldPen = (HPEN)SelectObject(memDC, pen);
             HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, GetStockObject(NULL_BRUSH));
 
-            int ox = 8, oy = TOOLBAR_H + 8;
             if (currentTool_ == Tool::Line) {
-                MoveToEx(memDC, ox + startPt_.x, oy + startPt_.y, nullptr);
-                LineTo(memDC, ox + lastPt_.x, oy + lastPt_.y);
+                MoveToEx(memDC, IMAGE_OFFSET_X + startPt_.x, IMAGE_OFFSET_Y + startPt_.y, nullptr);
+                LineTo(memDC, IMAGE_OFFSET_X + lastPt_.x, IMAGE_OFFSET_Y + lastPt_.y);
             } else {
                 Rectangle(memDC,
-                    ox + startPt_.x, oy + startPt_.y,
-                    ox + lastPt_.x, oy + lastPt_.y);
+                    IMAGE_OFFSET_X + startPt_.x, IMAGE_OFFSET_Y + startPt_.y,
+                    IMAGE_OFFSET_X + lastPt_.x, IMAGE_OFFSET_Y + lastPt_.y);
             }
             SelectObject(memDC, oldBrush);
             SelectObject(memDC, oldPen);
@@ -447,12 +523,18 @@ void ImageEditor::Run() {
     wc.lpszClassName = L"SnipEditorClass";
     RegisterClassExW(&wc);
 
-    int winW = imgW_ + 24;
-    int winH = imgH_ + TOOLBAR_H + 48;
+    // FIX: Гарантируем минимальный размер окна
+    int winW = std::max(MIN_WIN_W, imgW_ + 24);
+    int winH = std::max(MIN_WIN_H, imgH_ + TOOLBAR_H + 48);
 
-    // Center on the monitor where the selection was
     int x = screenRect_.left + (screenRect_.right - screenRect_.left - winW) / 2;
     int y = screenRect_.top  + (screenRect_.bottom - screenRect_.top - winH) / 2;
+
+    // FIX: Ограничиваем координаты, чтобы окно не улетело за пределы экрана
+    RECT workArea;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    x = std::max(workArea.left, std::min(x, workArea.right - winW));
+    y = std::max(workArea.top, std::min(y, workArea.bottom - winH));
 
     hwnd_ = CreateWindowExW(
         WS_EX_TOOLWINDOW,
@@ -466,6 +548,9 @@ void ImageEditor::Run() {
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
     SetForegroundWindow(hwnd_);
+
+    // FIX: Автоматическое копирование в буфер обмена при создании (без уведомления)
+    CopyToClipboard(false);
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0)) {
