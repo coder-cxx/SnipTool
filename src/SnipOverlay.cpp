@@ -9,12 +9,6 @@
 #include <cmath>
 #include <dwmapi.h>
 
-// DXGI / D3D11 for Desktop Duplication (best for 3D, CAD, games)
-#include <dxgi1_2.h>
-#include <d3d11.h>
-#pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "d3d11.lib")
-
 #ifndef PW_RENDERFULLCONTENT
 #define PW_RENDERFULLCONTENT 0x00000002
 #endif
@@ -52,184 +46,225 @@ void CleanupMem() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DXGI Desktop Duplication – primary path for 3D / CAD / games
-// Captures each monitor and stitches into the virtual-screen bitmap.
-// ---------------------------------------------------------------------------
-bool CaptureViaDXGI() {
-    HRESULT hr;
+bool IsOverlayOrWatermarkWindow(HWND hwnd) {
+    if (!hwnd) return true;
 
-    // Create D3D11 device
-    D3D_FEATURE_LEVEL featureLevel;
-    ID3D11Device* device = nullptr;
-    ID3D11DeviceContext* context = nullptr;
+    wchar_t className[256] = {};
+    wchar_t windowName[256] = {};
+    GetClassNameW(hwnd, className, 256);
+    GetWindowTextW(hwnd, windowName, 256);
 
-    hr = D3D11CreateDevice(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-        0, nullptr, 0, D3D11_SDK_VERSION,
-        &device, &featureLevel, &context);
+    auto toLower = [](std::wstring s) {
+        for (auto& c : s) c = static_cast<wchar_t>(towlower(c));
+        return s;
+    };
 
-    if (FAILED(hr)) {
-        // Try WARP as last resort
-        hr = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
-            0, nullptr, 0, D3D11_SDK_VERSION,
-            &device, &featureLevel, &context);
-        if (FAILED(hr)) return false;
+    std::wstring cls = toLower(className);
+    std::wstring title = toLower(windowName);
+
+    static const std::vector<std::wstring> blacklist = {
+        L"watermark", L"overlay", L"activatewindows", L"gamebar",
+        L"xbox", L"toast", L"notification", L"snipoverlayclass",
+        L"windows.ui.core.corewindow",
+        L"applicationframewindow"
+    };
+
+    for (const auto& banned : blacklist) {
+        if (cls.find(banned) != std::wstring::npos || title.find(banned) != std::wstring::npos)
+            return true;
     }
-
-    IDXGIDevice* dxgiDevice = nullptr;
-    hr = device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
-    if (FAILED(hr)) {
-        context->Release(); device->Release();
-        return false;
-    }
-
-    IDXGIAdapter* adapter = nullptr;
-    hr = dxgiDevice->GetAdapter(&adapter);
-    dxgiDevice->Release();
-    if (FAILED(hr)) {
-        context->Release(); device->Release();
-        return false;
-    }
-
-    // Prepare our target GDI bitmap
-    HDC screenDC = GetDC(nullptr);
-    g_state.memDC = CreateCompatibleDC(screenDC);
-    g_state.memBmp = CreateCompatibleBitmap(screenDC, g_state.screenW, g_state.screenH);
-    g_state.oldBmp = (HBITMAP)SelectObject(g_state.memDC, g_state.memBmp);
-
-    // Clear to black
-    RECT full{ 0, 0, g_state.screenW, g_state.screenH };
-    FillRect(g_state.memDC, &full, (HBRUSH)GetStockObject(BLACK_BRUSH));
-
-    bool anySuccess = false;
-
-    // Enumerate all outputs (monitors) on this adapter
-    for (UINT outputIdx = 0; ; ++outputIdx) {
-        IDXGIOutput* output = nullptr;
-        hr = adapter->EnumOutputs(outputIdx, &output);
-        if (hr == DXGI_ERROR_NOT_FOUND) break;
-        if (FAILED(hr)) continue;
-
-        IDXGIOutput1* output1 = nullptr;
-        hr = output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
-        output->Release();
-        if (FAILED(hr) || !output1) continue;
-
-        DXGI_OUTPUT_DESC outDesc{};
-        output1->GetDesc(&outDesc);
-        if (!outDesc.AttachedToDesktop) {
-            output1->Release();
-            continue;
-        }
-
-        // Create duplication for this output
-        IDXGIOutputDuplication* duplication = nullptr;
-        hr = output1->DuplicateOutput(device, &duplication);
-        output1->Release();
-        if (FAILED(hr) || !duplication) continue;
-
-        // Acquire one frame (timeout 500 ms)
-        DXGI_OUTDUPL_FRAME_INFO frameInfo{};
-        IDXGIResource* desktopResource = nullptr;
-        hr = duplication->AcquireNextFrame(500, &frameInfo, &desktopResource);
-
-        if (SUCCEEDED(hr) && desktopResource) {
-            ID3D11Texture2D* tex = nullptr;
-            hr = desktopResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
-            desktopResource->Release();
-
-            if (SUCCEEDED(hr) && tex) {
-                D3D11_TEXTURE2D_DESC desc{};
-                tex->GetDesc(&desc);
-
-                // Staging texture for CPU read
-                D3D11_TEXTURE2D_DESC stagingDesc = desc;
-                stagingDesc.Usage = D3D11_USAGE_STAGING;
-                stagingDesc.BindFlags = 0;
-                stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                stagingDesc.MiscFlags = 0;
-
-                ID3D11Texture2D* staging = nullptr;
-                hr = device->CreateTexture2D(&stagingDesc, nullptr, &staging);
-                if (SUCCEEDED(hr) && staging) {
-                    context->CopyResource(staging, tex);
-
-                    D3D11_MAPPED_SUBRESOURCE mapped{};
-                    hr = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
-                    if (SUCCEEDED(hr)) {
-                        // outDesc.DesktopCoordinates is in virtual-screen space
-                        int dstX = outDesc.DesktopCoordinates.left - g_state.screenLeft;
-                        int dstY = outDesc.DesktopCoordinates.top  - g_state.screenTop;
-                        int w = outDesc.DesktopCoordinates.right - outDesc.DesktopCoordinates.left;
-                        int h = outDesc.DesktopCoordinates.bottom - outDesc.DesktopCoordinates.top;
-
-                        // Create temporary GDI bitmap from the DXGI pixels (BGRA)
-                        BITMAPINFO bmi{};
-                        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                        bmi.bmiHeader.biWidth = static_cast<LONG>(desc.Width);
-                        bmi.bmiHeader.biHeight = -static_cast<LONG>(desc.Height); // top-down
-                        bmi.bmiHeader.biPlanes = 1;
-                        bmi.bmiHeader.biBitCount = 32;
-                        bmi.bmiHeader.biCompression = BI_RGB;
-
-                        // Copy row by row respecting pitch
-                        std::vector<uint8_t> pixels(static_cast<size_t>(desc.Width) * desc.Height * 4);
-                        const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
-                        for (UINT y = 0; y < desc.Height; ++y) {
-                            memcpy(pixels.data() + y * desc.Width * 4,
-                                   src + y * mapped.RowPitch,
-                                   desc.Width * 4);
-                        }
-
-                        context->Unmap(staging, 0);
-
-                        // StretchDIBits into our virtual-screen DC
-                        StretchDIBits(g_state.memDC,
-                            dstX, dstY, w, h,
-                            0, 0, desc.Width, desc.Height,
-                            pixels.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
-
-                        anySuccess = true;
-                    }
-                    staging->Release();
-                }
-                tex->Release();
-            }
-            duplication->ReleaseFrame();
-        }
-
-        duplication->Release();
-    }
-
-    adapter->Release();
-    context->Release();
-    device->Release();
-    ReleaseDC(nullptr, screenDC);
-
-    return anySuccess && g_state.memBmp != nullptr;
+    return false;
 }
 
-// ---------------------------------------------------------------------------
-// Classic BitBlt fallback (works for many borderless / windowed GPU apps)
-// ---------------------------------------------------------------------------
-bool CaptureViaBitBlt() {
-    CleanupMem();
+struct WindowInfo {
+    HWND hwnd;
+    RECT rect;
+};
 
-    HDC screenDC = GetDC(nullptr);
-    if (!screenDC) return false;
+BOOL CALLBACK CollectWindows(HWND hwnd, LPARAM lParam) {
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    if (IsIconic(hwnd)) return TRUE;
+    if (hwnd == g_state.hwnd) return TRUE;
+    if (hwnd == GetShellWindow()) return TRUE;
+    if (IsOverlayOrWatermarkWindow(hwnd)) return TRUE;
 
-    g_state.memDC = CreateCompatibleDC(screenDC);
-    g_state.memBmp = CreateCompatibleBitmap(screenDC, g_state.screenW, g_state.screenH);
-    g_state.oldBmp = (HBITMAP)SelectObject(g_state.memDC, g_state.memBmp);
+    wchar_t cls[256] = {};
+    GetClassNameW(hwnd, cls, 256);
 
-    BOOL ok = BitBlt(g_state.memDC, 0, 0, g_state.screenW, g_state.screenH,
-                     screenDC, g_state.screenLeft, g_state.screenTop,
-                     SRCCOPY | CAPTUREBLT);
+    if (wcscmp(cls, L"Progman") == 0 ||
+        wcscmp(cls, L"WorkerW") == 0 ||
+        wcscmp(cls, L"Shell_TrayWnd") == 0 ||
+        wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0) {
+        return TRUE;
+    }
 
-    ReleaseDC(nullptr, screenDC);
-    return ok && g_state.memBmp != nullptr;
+    // Cloaked windows
+    BOOL cloaked = FALSE;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, 14 /*DWMWA_CLOAKED*/, &cloaked, sizeof(cloaked))) && cloaked)
+        return TRUE;
+
+    RECT rc{};
+    if (!GetWindowRect(hwnd, &rc)) return TRUE;
+    if ((rc.right - rc.left) <= 1 || (rc.bottom - rc.top) <= 1) return TRUE;
+
+    if (rc.right <= g_state.screenLeft || rc.bottom <= g_state.screenTop ||
+        rc.left >= g_state.screenLeft + g_state.screenW ||
+        rc.top  >= g_state.screenTop  + g_state.screenH)
+        return TRUE;
+
+    auto& windows = *reinterpret_cast<std::vector<WindowInfo>*>(lParam);
+    windows.push_back({ hwnd, rc });
+    return TRUE;
+}
+
+bool HasMeaningfulContent(HBITMAP hBmp, int width, int height) {
+    if (!hBmp || width <= 0 || height <= 0) return false;
+
+    BITMAPINFO bi{ sizeof(BITMAPINFOHEADER) };
+    bi.bmiHeader.biWidth = width;
+    bi.bmiHeader.biHeight = -height;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    const size_t count = static_cast<size_t>(width) * height;
+    std::vector<uint32_t> pixels(count);
+
+    HDC hdc = GetDC(nullptr);
+    int got = GetDIBits(hdc, hBmp, 0, height, pixels.data(), &bi, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, hdc);
+    if (got == 0) return false;
+
+    size_t step = (std::max)(size_t(1), count / 40);
+    int nonBlack = 0;
+    for (size_t i = 0; i < count; i += step) {
+        if ((pixels[i] & 0x00FFFFFF) != 0) ++nonBlack;
+    }
+
+    // corners + center
+    auto check = [&](int x, int y) {
+        if (x >= 0 && y >= 0 && x < width && y < height)
+            if ((pixels[static_cast<size_t>(y) * width + x] & 0x00FFFFFF) != 0) ++nonBlack;
+    };
+    check(0, 0); check(width-1, 0); check(0, height-1); check(width-1, height-1);
+    check(width/2, height/2);
+
+    return nonBlack >= 3;
+}
+
+// Захват одного окна: PrintWindow → fallback BitBlt (для 3D/CAD/игр)
+HBITMAP CaptureWindowContent(HWND hwnd, int width, int height) {
+    HDC hdcScreen = GetDC(nullptr);
+    HDC memDC = CreateCompatibleDC(hdcScreen);
+    HBITMAP hBmp = CreateCompatibleBitmap(hdcScreen, width, height);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, hBmp);
+
+    RECT rc{ 0, 0, width, height };
+    FillRect(memDC, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+    // 1. PrintWindow full content (лучше всего убирает оверлеи)
+    BOOL ok = PrintWindow(hwnd, memDC, PW_RENDERFULLCONTENT);
+    bool good = ok && HasMeaningfulContent(hBmp, width, height);
+
+    // 2. Обычный PrintWindow
+    if (!good) {
+        ok = PrintWindow(hwnd, memDC, 0);
+        good = ok && HasMeaningfulContent(hBmp, width, height);
+    }
+
+    // 3. BitBlt с GetWindowDC — часто спасает 3D/CAD/игры в оконном/borderless режиме
+    if (!good) {
+        HDC hdcWin = GetWindowDC(hwnd);
+        if (hdcWin) {
+            BitBlt(memDC, 0, 0, width, height, hdcWin, 0, 0, SRCCOPY | CAPTUREBLT);
+            ReleaseDC(hwnd, hdcWin);
+            good = HasMeaningfulContent(hBmp, width, height);
+        }
+    }
+
+    // 4. Client area
+    if (!good) {
+        HDC hdcClient = GetDC(hwnd);
+        if (hdcClient) {
+            BitBlt(memDC, 0, 0, width, height, hdcClient, 0, 0, SRCCOPY | CAPTUREBLT);
+            ReleaseDC(hwnd, hdcClient);
+        }
+    }
+
+    SelectObject(memDC, oldBmp);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, hdcScreen);
+    return hBmp;
+}
+
+void DrawWindowToCanvas(const WindowInfo& info) {
+    const RECT& rc = info.rect;
+    int width  = rc.right - rc.left;
+    int height = rc.bottom - rc.top;
+    if (width <= 0 || height <= 0) return;
+
+    HBITMAP hBmp = CaptureWindowContent(info.hwnd, width, height);
+    if (!hBmp) return;
+
+    int dstX = rc.left - g_state.screenLeft;
+    int dstY = rc.top  - g_state.screenTop;
+
+    int srcX = 0, srcY = 0;
+    int drawW = width, drawH = height;
+
+    if (dstX < 0) { srcX = -dstX; drawW += dstX; dstX = 0; }
+    if (dstY < 0) { srcY = -dstY; drawH += dstY; dstY = 0; }
+    if (dstX + drawW > g_state.screenW) drawW = g_state.screenW - dstX;
+    if (dstY + drawH > g_state.screenH) drawH = g_state.screenH - dstY;
+
+    if (drawW <= 0 || drawH <= 0) {
+        DeleteObject(hBmp);
+        return;
+    }
+
+    HDC hdcScreen = GetDC(nullptr);
+    HDC srcDC = CreateCompatibleDC(hdcScreen);
+    HBITMAP old = (HBITMAP)SelectObject(srcDC, hBmp);
+
+    LONG exStyle = GetWindowLongW(info.hwnd, GWL_EXSTYLE);
+    bool layered = (exStyle & WS_EX_LAYERED) != 0;
+
+    if (layered) {
+        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        AlphaBlend(g_state.memDC, dstX, dstY, drawW, drawH,
+                   srcDC, srcX, srcY, drawW, drawH, bf);
+    } else {
+        BitBlt(g_state.memDC, dstX, dstY, drawW, drawH, srcDC, srcX, srcY, SRCCOPY);
+    }
+
+    SelectObject(srcDC, old);
+    DeleteDC(srcDC);
+    ReleaseDC(nullptr, hdcScreen);
+    DeleteObject(hBmp);
+}
+
+void CaptureDesktopBackground() {
+    HBRUSH br = CreateSolidBrush(RGB(32, 32, 32));
+    RECT full{ 0, 0, g_state.screenW, g_state.screenH };
+    FillRect(g_state.memDC, &full, br);
+    DeleteObject(br);
+
+    HWND hDesktop = GetDesktopWindow();
+    if (hDesktop) {
+        if (!PrintWindow(hDesktop, g_state.memDC, PW_RENDERFULLCONTENT)) {
+            PrintWindow(hDesktop, g_state.memDC, 0);
+        }
+    }
+
+    // Если фон всё ещё почти пустой — классический BitBlt
+    if (!HasMeaningfulContent(g_state.memBmp, g_state.screenW, g_state.screenH)) {
+        HDC screenDC = GetDC(nullptr);
+        if (screenDC) {
+            BitBlt(g_state.memDC, 0, 0, g_state.screenW, g_state.screenH,
+                   screenDC, g_state.screenLeft, g_state.screenTop, SRCCOPY | CAPTUREBLT);
+            ReleaseDC(nullptr, screenDC);
+        }
+    }
 }
 
 bool CaptureFullScreen() {
@@ -240,18 +275,33 @@ bool CaptureFullScreen() {
     g_state.screenW    = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     g_state.screenH    = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
-    // 1. Prefer DXGI Desktop Duplication (3D / CAD / games)
-    if (CaptureViaDXGI()) {
-        return true;
+    HDC screenDC = GetDC(nullptr);
+    if (!screenDC) return false;
+
+    g_state.memDC  = CreateCompatibleDC(screenDC);
+    g_state.memBmp = CreateCompatibleBitmap(screenDC, g_state.screenW, g_state.screenH);
+    g_state.oldBmp = (HBITMAP)SelectObject(g_state.memDC, g_state.memBmp);
+    ReleaseDC(nullptr, screenDC);
+
+    // 1. Фон
+    CaptureDesktopBackground();
+
+    // 2. Все обычные окна (без оверлеев)
+    std::vector<WindowInfo> windows;
+    EnumWindows(CollectWindows, reinterpret_cast<LPARAM>(&windows));
+
+    // EnumWindows идёт top → bottom, рисуем bottom → top
+    std::reverse(windows.begin(), windows.end());
+
+    for (const auto& w : windows) {
+        DrawWindowToCanvas(w);
     }
 
-    // 2. Fallback to classic BitBlt
-    return CaptureViaBitBlt();
+    return g_state.memBmp != nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// Layered overlay for selection + dimming
-// ---------------------------------------------------------------------------
+// ---------- Layered overlay (затемнение + выделение) ----------
+
 HBITMAP CreateARGBSurface(int w, int h, void** bits) {
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -473,7 +523,7 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
         resultBmp = CreateCompatibleBitmap(screenDC, w, h);
         HBITMAP old = (HBITMAP)SelectObject(selDC, resultBmp);
 
-        // Coordinates are already relative to the virtual-screen origin
+        // Координаты уже относительно виртуального экрана
         BitBlt(selDC, 0, 0, w, h, g_state.memDC, selected.left, selected.top, SRCCOPY);
 
         SelectObject(selDC, old);
