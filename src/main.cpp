@@ -6,6 +6,7 @@
 
 #include "SnipOverlay.hpp"
 #include "ImageEditor.hpp"
+#include "resource.h" 
 
 // Hotkey ID
 constexpr int HOTKEY_ID = 1;
@@ -15,6 +16,7 @@ constexpr UINT WM_TRAYICON = WM_APP + 1;
 HINSTANCE g_hInstance = nullptr;
 HWND g_hwndMain = nullptr;
 NOTIFYICONDATAW g_nid{};
+HICON g_hAppIcon = nullptr;
 
 void ShowTrayMenu(HWND hwnd) {
     POINT pt;
@@ -87,10 +89,19 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     g_hInstance = hInstance;
 
+    g_hAppIcon = (HICON)LoadImageW(
+        hInstance,
+        MAKEINTRESOURCEW(IDI_APP_ICON),
+        IMAGE_ICON,
+        32, 32,
+        LR_DEFAULTCOLOR);
+
     // Register a hidden message-only window to receive hotkeys
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.lpfnWndProc = MainWndProc;
     wc.hInstance = hInstance;
+    wc.hIcon = g_hAppIcon;
+    wc.hIconSm = g_hAppIcon;
     wc.lpszClassName = L"SnipToolMainClass";
     RegisterClassExW(&wc);
 
@@ -115,7 +126,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); // IDI_APPLICATION
+    //g_nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); // IDI_APPLICATION
+    g_nid.hIcon = g_hAppIcon;
     wcscpy_s(g_nid.szTip, L"SnipTool — Ctrl+Shift+S to capture");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 

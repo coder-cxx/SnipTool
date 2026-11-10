@@ -17,6 +17,7 @@ add_executable(SnipTool WIN32
     src/main.cpp
     src/SnipOverlay.cpp
     src/ImageEditor.cpp
+    src/app.rc
 )
 
 target_include_directories(SnipTool PRIVATE include)

@@ -20,7 +20,6 @@ constexpr int MARGIN_Y_TOP = 6;
 constexpr int IMAGE_OFFSET_X = 8;
 constexpr int IMAGE_OFFSET_Y = TOOLBAR_H + 8;
 
-// Минимальные размеры окна, чтобы влезала вся панель инструментов
 constexpr int MIN_WIN_W = 760;
 constexpr int MIN_WIN_H = 200;
 
@@ -62,6 +61,8 @@ ImageEditor::ImageEditor(HINSTANCE hInstance, HBITMAP hSourceBmp, const RECT& sc
     imgH_ = bm.bmHeight;
 
     HDC screenDC = GetDC(nullptr);
+    
+    // Копируем исходный битмап
     HDC srcDC = CreateCompatibleDC(screenDC);
     HBITMAP oldSrc = (HBITMAP)SelectObject(srcDC, hSourceBmp);
 
@@ -74,11 +75,13 @@ ImageEditor::ImageEditor(HINSTANCE hInstance, HBITMAP hSourceBmp, const RECT& sc
 
     SelectObject(srcDC, oldSrc);
     DeleteDC(srcDC);
-    ReleaseDC(nullptr, screenDC);
 
-    hdcCanvas_ = CreateCompatibleDC(nullptr);
+    // ИСПРАВЛЕНО: Создаем canvas ДО освобождения screenDC
+    hdcCanvas_ = CreateCompatibleDC(screenDC);
     hCanvas_ = CreateCompatibleBitmap(screenDC, imgW_, imgH_);
     hOldCanvas_ = (HBITMAP)SelectObject(hdcCanvas_, hCanvas_);
+
+    ReleaseDC(nullptr, screenDC);
 
     RebuildCanvas();
 }
@@ -157,7 +160,6 @@ void ImageEditor::OnPaint(HDC hdc) {
 
     BitBlt(hdc, IMAGE_OFFSET_X, IMAGE_OFFSET_Y, imgW_, imgH_, hdcCanvas_, 0, 0, SRCCOPY);
 
-    // Отрисовка палитры быстрых цветов
     int px = MARGIN_X + PALETTE_BTN_OFFSET * (BTN_W + 6);
     int py = MARGIN_Y_TOP;
     for (int i = 0; i < 6; ++i) {
@@ -185,7 +187,6 @@ void ImageEditor::OnPaint(HDC hdc) {
         }
     }
 
-    // Рамка вокруг изображения
     HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(100, 100, 100));
     HPEN oldBp = (HPEN)SelectObject(hdc, borderPen);
     HBRUSH oldBb = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
@@ -535,7 +536,6 @@ void ImageEditor::Run() {
     UpdateWindow(hwnd_);
     SetForegroundWindow(hwnd_);
 
-    // Автоматическое копирование в буфер обмена при создании (без уведомления)
     CopyToClipboard(false);
 
     MSG msg{};
