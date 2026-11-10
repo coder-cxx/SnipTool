@@ -89,12 +89,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     g_hInstance = hInstance;
 
+    /*
     g_hAppIcon = (HICON)LoadImageW(
         hInstance,
         MAKEINTRESOURCEW(IDI_APP_ICON),
         IMAGE_ICON,
         32, 32,
-        LR_DEFAULTCOLOR);
+        LR_DEFAULTCOLOR);*/
+
+    g_hAppIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APP_ICON));
+
 
     // Register a hidden message-only window to receive hotkeys
     WNDCLASSEXW wc{ sizeof(wc) };
@@ -128,9 +132,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     g_nid.uCallbackMessage = WM_TRAYICON;
     //g_nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); // IDI_APPLICATION
     g_nid.hIcon = g_hAppIcon;
-    wcscpy_s(g_nid.szTip, L"SnipTool — Ctrl+Shift+S to capture");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
 
+    wcscpy_s(g_nid.szTip, L"SnipTool — Ctrl+Shift+S to capture");
+
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
