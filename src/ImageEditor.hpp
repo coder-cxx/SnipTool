@@ -63,14 +63,21 @@ private:
     void ContinueStroke(POINT pt);
     void EndStroke(POINT pt);
     
-    // Изменено: добавлен параметр уведомления
     void CopyToClipboard(bool showNotification = true);
-    
     void SaveToFile();
     void Undo();
     void UpdateToolButtons();
 
     // Палитра
-    static constexpr int PALETTE_BTN_OFFSET = 7; // После 7-й кнопки
-    static constexpr COLORREF paletteColors_[6];
+    static constexpr int PALETTE_BTN_OFFSET = 7;
+    
+    // FIX: inline static constexpr с инициализацией прямо здесь
+    inline static constexpr COLORREF paletteColors_[6] = {
+        RGB(255, 0, 0),    // Red
+        RGB(0, 255, 0),    // Green
+        RGB(0, 0, 255),    // Blue
+        RGB(255, 255, 0),  // Yellow
+        RGB(0, 0, 0),      // Black
+        RGB(255, 255, 255) // White
+    };
 };

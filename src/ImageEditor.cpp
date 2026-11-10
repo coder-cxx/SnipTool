@@ -54,6 +54,7 @@ POINT GetImagePoint(LPARAM lParam) {
 } // namespace
 
 // Инициализация статического массива цветов палитры
+/*
 constexpr COLORREF ImageEditor::paletteColors_[6] = {
     RGB(255, 0, 0),    // Red
     RGB(0, 255, 0),    // Green
@@ -62,6 +63,7 @@ constexpr COLORREF ImageEditor::paletteColors_[6] = {
     RGB(0, 0, 0),      // Black
     RGB(255, 255, 255) // White
 };
+*/
 
 ImageEditor::ImageEditor(HINSTANCE hInstance, HBITMAP hSourceBmp, const RECT& screenRect)
     : hInst_(hInstance), screenRect_(screenRect)
