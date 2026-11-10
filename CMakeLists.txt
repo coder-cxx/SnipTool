@@ -37,6 +37,7 @@ target_link_libraries(SnipTool PRIVATE
     ole32
     shell32
     comdlg32
+    dwmapi
 )
 
 if(MINGW)
