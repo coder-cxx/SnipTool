@@ -5,6 +5,12 @@
 #include <algorithm>
 #include <vector>
 
+// Подключаем DXGI и Direct3D 11 для "чистого" захвата
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+
 namespace {
 
 struct OverlayState {
@@ -38,9 +44,127 @@ void CleanupMem() {
     }
 }
 
-bool CaptureFullScreen() {
-    CleanupMem();
+// === СПОСОБ 2: DXGI Desktop Duplication (Чистый захват с GPU) ===
+HBITMAP CaptureScreenDXGI(int& outW, int& outH) {
+    HRESULT hr;
+    HBITMAP hResultBmp = nullptr;
 
+    // 1. Инициализация COM
+    hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr)) return nullptr;
+
+    // 2. Создание D3D11 устройства
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                           D3D11_SDK_VERSION, &device, nullptr, &context);
+    if (FAILED(hr)) {
+        CoUninitialize();
+        return nullptr;
+    }
+
+    // 3. Получение DXGI адаптера и вывода (монитора)
+    IDXGIDevice* dxgiDevice = nullptr;
+    hr = device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
+    if (SUCCEEDED(hr)) {
+        IDXGIAdapter* adapter = nullptr;
+        hr = dxgiDevice->GetAdapter(&adapter);
+        if (SUCCEEDED(hr)) {
+            IDXGIOutput* output = nullptr;
+            hr = adapter->EnumOutputs(0, &output); // 0 = основной монитор
+            if (SUCCEEDED(hr)) {
+                IDXGIOutput1* output1 = nullptr;
+                hr = output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
+                if (SUCCEEDED(hr)) {
+                    // 4. Создание дубликата вывода
+                    IDXGIOutputDuplication* duplication = nullptr;
+                    hr = output1->DuplicateOutput(device, &duplication);
+                    if (SUCCEEDED(hr)) {
+                        // 5. Захват кадра
+                        DXGI_OUTDUPL_FRAME_INFO frameInfo;
+                        IDXGIResource* resource = nullptr;
+                        hr = duplication->AcquireNextFrame(1000, &frameInfo, &resource);
+                        
+                        if (SUCCEEDED(hr) && resource) {
+                            // 6. Получение текстуры
+                            ID3D11Texture2D* tex = nullptr;
+                            hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
+                            if (SUCCEEDED(hr)) {
+                                D3D11_TEXTURE2D_DESC desc;
+                                tex->GetDesc(&desc);
+                                outW = desc.Width;
+                                outH = desc.Height;
+
+                                // 7. Создание staging-текстуры для чтения CPU
+                                desc.Usage = D3D11_USAGE_STAGING;
+                                desc.BindFlags = 0;
+                                desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                                desc.MiscFlags = 0;
+                                
+                                ID3D11Texture2D* stagingTex = nullptr;
+                                hr = device->CreateTexture2D(&desc, nullptr, &stagingTex);
+                                if (SUCCEEDED(hr)) {
+                                    // 8. Копирование и маппинг
+                                    context->CopyResource(stagingTex, tex);
+                                    D3D11_MAPPED_SUBRESOURCE mapped;
+                                    hr = context->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+                                    
+                                    if (SUCCEEDED(hr)) {
+                                        // 9. Конвертация в HBITMAP
+                                        BITMAPINFO bmi{};
+                                        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                                        bmi.bmiHeader.biWidth = outW;
+                                        bmi.bmiHeader.biHeight = -outH; // top-down
+                                        bmi.bmiHeader.biPlanes = 1;
+                                        bmi.bmiHeader.biBitCount = 32;
+                                        bmi.bmiHeader.biCompression = BI_RGB;
+
+                                        HDC hdc = GetDC(nullptr);
+                                        void* bits = nullptr;
+                                        hResultBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+                                        
+                                        if (hResultBmp && bits) {
+                                            // Копируем пиксели (BGRA)
+                                            uint8_t* src = static_cast<uint8_t*>(mapped.pData);
+                                            uint8_t* dst = static_cast<uint8_t*>(bits);
+                                            size_t rowBytes = outW * 4;
+                                            
+                                            for (int y = 0; y < outH; ++y) {
+                                                memcpy(dst + y * rowBytes, src + y * mapped.RowPitch, rowBytes);
+                                            }
+                                        }
+                                        ReleaseDC(nullptr, hdc);
+                                        context->Unmap(stagingTex, 0);
+                                    }
+                                    if (stagingTex) stagingTex->Release();
+                                }
+                                tex->Release();
+                            }
+                            duplication->ReleaseFrame();
+                            duplication->Release();
+                        }
+                        if (resource) resource->Release();
+                    }
+                    output1->Release();
+                }
+                output->Release();
+            }
+            adapter->Release();
+        }
+        dxgiDevice->Release();
+    }
+
+    // 10. Очистка
+    if (context) context->Release();
+    if (device) device->Release();
+    CoUninitialize();
+
+    return hResultBmp;
+}
+
+// === FALLBACK: Старый метод, если DXGI не сработал ===
+bool CaptureFullScreenFallback() {
+    CleanupMem();
     g_state.screenLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
     g_state.screenTop  = GetSystemMetrics(SM_YVIRTUALSCREEN);
     g_state.screenW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -51,11 +175,41 @@ bool CaptureFullScreen() {
     g_state.memBmp = CreateCompatibleBitmap(screenDC, g_state.screenW, g_state.screenH);
     g_state.oldBmp = (HBITMAP)SelectObject(g_state.memDC, g_state.memBmp);
 
+    // Пытаемся скрыть известные оверлеи перед захватом (дополнительная защита)
+    HWND hwndOverlay = FindWindowW(L"DiscordOverlay", nullptr);
+    bool wasVisible = hwndOverlay && IsWindowVisible(hwndOverlay);
+    if (wasVisible) ShowWindow(hwndOverlay, SW_HIDE);
+
     BitBlt(g_state.memDC, 0, 0, g_state.screenW, g_state.screenH,
            screenDC, g_state.screenLeft, g_state.screenTop, SRCCOPY | CAPTUREBLT);
 
+    if (wasVisible) ShowWindow(hwndOverlay, SW_SHOW); // Восстанавливаем
+
     ReleaseDC(nullptr, screenDC);
     return g_state.memBmp != nullptr;
+}
+
+bool CaptureFullScreen() {
+    CleanupMem();
+    
+    // Пробуем современный "чистый" метод
+    HBITMAP dxgiBmp = CaptureScreenDXGI(g_state.screenW, g_state.screenH);
+    
+    if (dxgiBmp) {
+        // DXGI успешен. Подготавливаем state так, как это делал старый код
+        g_state.screenLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        g_state.screenTop  = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        
+        HDC screenDC = GetDC(nullptr);
+        g_state.memDC = CreateCompatibleDC(screenDC);
+        g_state.oldBmp = (HBITMAP)SelectObject(g_state.memDC, dxgiBmp);
+        g_state.memBmp = dxgiBmp; // Теперь memBmp указывает на DXGI-битмап
+        ReleaseDC(nullptr, screenDC);
+        return true;
+    }
+
+    // Fallback, если DXGI не поддерживается (редко, но бывает на VM или старых драйверах)
+    return CaptureFullScreenFallback();
 }
 
 // Create a 32-bit ARGB dibsection for layered window
@@ -97,11 +251,10 @@ void UpdateLayeredContent(HWND hwnd) {
 
     // Darken everything (aggressive ~70% black overlay)
     for (int i = 0; i < total; ++i) {
-        // pre-multiplied-ish darken
         p[0] = static_cast<uint8_t>(p[0] * 0.30); // B
         p[1] = static_cast<uint8_t>(p[1] * 0.30); // G
         p[2] = static_cast<uint8_t>(p[2] * 0.30); // R
-        p[3] = 255; // A fully opaque (we darken the content itself)
+        p[3] = 255; // A
         p += 4;
     }
 
@@ -112,11 +265,9 @@ void UpdateLayeredContent(HWND hwnd) {
         int x2 = (std::max)(g_state.start.x, g_state.current.x);
         int y2 = (std::max)(g_state.start.y, g_state.current.y);
 
-        // clamp
         x1 = (std::max)(0, x1); y1 = (std::max)(0, y1);
         x2 = (std::min)(g_state.screenW, x2); y2 = (std::min)(g_state.screenH, y2);
 
-        // Get original bits again for the rect
         std::vector<uint8_t> orig(g_state.screenW * g_state.screenH * 4);
         HDC hdc = GetDC(nullptr);
         GetDIBits(hdc, g_state.memBmp, 0, g_state.screenH, orig.data(), &bmi, DIB_RGB_COLORS);
@@ -133,7 +284,7 @@ void UpdateLayeredContent(HWND hwnd) {
             }
         }
 
-        // Draw selection border (simple blue-ish)
+        // Draw selection border
         auto setPixel = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
             if (x < 0 || y < 0 || x >= g_state.screenW || y >= g_state.screenH) return;
             int idx = (y * g_state.screenW + x) * 4;
@@ -141,7 +292,6 @@ void UpdateLayeredContent(HWND hwnd) {
             d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
         };
 
-        // 2px border
         for (int t = 0; t < 2; ++t) {
             for (int x = x1; x < x2; ++x) {
                 setPixel(x, y1 + t, 0, 120, 215);
@@ -154,7 +304,6 @@ void UpdateLayeredContent(HWND hwnd) {
         }
     }
 
-    // Update the layered window
     HDC hdcScreen2 = GetDC(nullptr);
     HDC hdcMem = CreateCompatibleDC(hdcScreen2);
     HBITMAP old = (HBITMAP)SelectObject(hdcMem, argbBmp);
@@ -177,7 +326,6 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_CREATE:
         SetCursor(LoadCursor(nullptr, IDC_CROSS));
         return 0;
-
     case WM_LBUTTONDOWN:
         g_state.selecting = true;
         g_state.start.x = GET_X_LPARAM(lParam);
@@ -186,7 +334,6 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         SetCapture(hwnd);
         UpdateLayeredContent(hwnd);
         return 0;
-
     case WM_MOUSEMOVE:
         if (g_state.selecting) {
             g_state.current.x = GET_X_LPARAM(lParam);
@@ -194,7 +341,6 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             UpdateLayeredContent(hwnd);
         }
         return 0;
-
     case WM_LBUTTONUP:
         if (g_state.selecting) {
             g_state.selecting = false;
@@ -214,14 +360,12 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             DestroyWindow(hwnd);
         }
         return 0;
-
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
             g_state.cancelled = true;
             DestroyWindow(hwnd);
         }
         return 0;
-
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -261,8 +405,6 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
     }
 
     g_state.hwnd = hwnd;
-
-    // Initial full dim
     UpdateLayeredContent(hwnd);
 
     ShowWindow(hwnd, SW_SHOW);
@@ -281,10 +423,6 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
 
     if (g_state.finished && !g_state.cancelled) {
         selected = g_state.result;
-
-        // Convert selection coords from client (relative to virtual screen origin) 
-        // already correct because window is at virtual screen origin.
-
         int w = selected.right - selected.left;
         int h = selected.bottom - selected.top;
 
@@ -294,7 +432,7 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
         HBITMAP old = (HBITMAP)SelectObject(selDC, resultBmp);
 
         BitBlt(selDC, 0, 0, w, h, g_state.memDC,
-               selected.left, selected.top, SRCCOPY);
+               selected.left - g_state.screenLeft, selected.top - g_state.screenTop, SRCCOPY);
 
         SelectObject(selDC, old);
         DeleteDC(selDC);
