@@ -11,8 +11,8 @@
 void PutBitmapToClipboard(HBITMAP hBmp);
 #include "resource.h"
 
-constexpr int HOTKEY_ID_CTRLSHIFTS = 1;
-constexpr int HOTKEY_ID_PRINTSCREEN = 2;
+constexpr int HOTKEY_ID = 1;
+constexpr int HOTKEY_ID_PRTSC = 2;
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 
 HINSTANCE g_hInstance = nullptr;
@@ -27,11 +27,10 @@ void ShowTrayMenu(HWND hwnd) {
     HMENU hMenu = CreatePopupMenu();
     if (!hMenu) return;
 
-    AppendMenuW(hMenu, MF_STRING, 1, L"Capture (PrintScreen / Ctrl+Shift+S)");
+    AppendMenuW(hMenu, MF_STRING, 1, L"Capture (Ctrl+Shift+S)");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, 2, L"Exit");
 
-    // Хак для корректного закрытия меню при клике вне его
     SetForegroundWindow(hwnd);
 
     UINT cmd = TrackPopupMenu(hMenu,
@@ -39,29 +38,35 @@ void ShowTrayMenu(HWND hwnd) {
         pt.x, pt.y, 0, hwnd, nullptr);
 
     DestroyMenu(hMenu);
-    PostMessageW(hwnd, WM_NULL, 0, 0); // Позволяет меню корректно закрыться
+    PostMessageW(hwnd, WM_NULL, 0, 0);
 
     if (cmd == 1) {
-        PostMessageW(hwnd, WM_HOTKEY, HOTKEY_ID_CTRLSHIFTS, 0);
+        PostMessageW(hwnd, WM_HOTKEY, HOTKEY_ID, 0);
     }
     else if (cmd == 2) {
-        // ИСПРАВЛЕНО: Используем WM_CLOSE вместо прямого DestroyWindow.
-        // Это безопаснее для порядка обработки сообщений.
-        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        DestroyWindow(hwnd);
     }
 }
 
 LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_HOTKEY:
-        if (wParam == HOTKEY_ID_CTRLSHIFTS || wParam == HOTKEY_ID_PRINTSCREEN) {
+        if (wParam == HOTKEY_ID) {
+            // Ctrl+Shift+S → region select + editor
             RECT selected{};
             HBITMAP hBmp = SnipOverlay::CaptureRegion(g_hInstance, selected);
             if (hBmp) {
                 PutBitmapToClipboard(hBmp);
-
                 ImageEditor editor(g_hInstance, hBmp, selected);
                 editor.Run();
+                DeleteObject(hBmp);
+            }
+        }
+        else if (wParam == HOTKEY_ID_PRTSC) {
+            // PrintScreen → full screen, no editor, straight to clipboard
+            HBITMAP hBmp = SnipOverlay::CaptureFullScreenBitmap();
+            if (hBmp) {
+                PutBitmapToClipboard(hBmp);
                 DeleteObject(hBmp);
             }
         }
@@ -72,36 +77,20 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             ShowTrayMenu(hwnd);
         }
         else if (lParam == WM_LBUTTONDBLCLK) {
-            PostMessageW(hwnd, WM_HOTKEY, HOTKEY_ID_CTRLSHIFTS, 0);
+            PostMessageW(hwnd, WM_HOTKEY, HOTKEY_ID, 0);
         }
         break;
 
-    case WM_CLOSE:
-        // ИСПРАВЛЕНО: Добавлен явный обработчик закрытия
-        DestroyWindow(hwnd);
-        return 0;
-
     case WM_DESTROY:
-        UnregisterHotKey(hwnd, HOTKEY_ID_CTRLSHIFTS);
-        UnregisterHotKey(hwnd, HOTKEY_ID_PRINTSCREEN);
+        UnregisterHotKey(hwnd, HOTKEY_ID);
+        UnregisterHotKey(hwnd, HOTKEY_ID_PRTSC);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         if (g_hTrayIcon) {
             DestroyIcon(g_hTrayIcon);
             g_hTrayIcon = nullptr;
         }
-        
-        // Стандартный сигнал к завершению цикла сообщений
         PostQuitMessage(0);
-        
-        // ГАРАНТИРОВАННОЕ ЗАВЕРШЕНИЕ:
-        // Если сообщение WM_QUIT было "съедено" вложенным циклом GetMessage 
-        // (например, от окна ImageEditor, которое не успело полностью закрыться), 
-        // главный цикл wWinMain продолжит висеть в ожидании. 
-        // ExitProcess(0) после очистки ресурсов гарантирует, что процесс 
-        // не останется висеть в диспетчере задач как "зомби".
-        // Для утилиты скриншотов это абсолютно безопасно, так как все данные 
-        // уже сохранены в буфер обмена или файл.
-        ExitProcess(0);
+        break;
 
     default:
         return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -128,16 +117,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         return 1;
     }
 
-    if (!RegisterHotKey(g_hwndMain, HOTKEY_ID_CTRLSHIFTS, MOD_CONTROL | MOD_SHIFT, 'S')) {
+    if (!RegisterHotKey(g_hwndMain, HOTKEY_ID, MOD_CONTROL | MOD_SHIFT, 'S')) {
         MessageBoxW(nullptr, L"Failed to register hotkey Ctrl+Shift+S.\nMaybe already in use.", L"SnipTool", MB_ICONWARNING);
     }
 
-    if (!RegisterHotKey(g_hwndMain, HOTKEY_ID_PRINTSCREEN, 0, VK_SNAPSHOT)) {
-        MessageBoxW(nullptr, L"Failed to register hotkey PrintScreen.\nMaybe already in use by another app.", L"SnipTool", MB_ICONWARNING);
+    // PrintScreen (no modifiers). May fail if another app already owns it.
+    if (!RegisterHotKey(g_hwndMain, HOTKEY_ID_PRTSC, 0, VK_SNAPSHOT)) {
+        // Try with MOD_NOREPEAT
+        RegisterHotKey(g_hwndMain, HOTKEY_ID_PRTSC, MOD_NOREPEAT, VK_SNAPSHOT);
     }
 
+    // Load icon from embedded resources
     g_hTrayIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_TRAYICON));
     if (!g_hTrayIcon) {
+        // Fallback if resource missing
         g_hTrayIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
     }
 
@@ -147,7 +140,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = g_hTrayIcon;
-    wcscpy_s(g_nid.szTip, L"SnipTool — PrintScreen or Ctrl+Shift+S to capture");
+    wcscpy_s(g_nid.szTip, L"SnipTool — Ctrl+Shift+S / PrtSc");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     MSG msg{};

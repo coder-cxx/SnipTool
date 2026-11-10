@@ -9,6 +9,10 @@
 #include <cmath>
 #include <dwmapi.h>
 
+#ifndef DWMWA_EXTENDED_FRAME_BOUNDS
+#define DWMWA_EXTENDED_FRAME_BOUNDS 9
+#endif
+
 #ifndef PW_RENDERFULLCONTENT
 #define PW_RENDERFULLCONTENT 0x00000002
 #endif
@@ -104,7 +108,10 @@ BOOL CALLBACK CollectWindows(HWND hwnd, LPARAM lParam) {
         return TRUE;
 
     RECT rc{};
-    if (!GetWindowRect(hwnd, &rc)) return TRUE;
+    // Prefer visible frame without DWM drop-shadow margins (avoids black borders)
+    if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rc, sizeof(rc)))) {
+        if (!GetWindowRect(hwnd, &rc)) return TRUE;
+    }
     if ((rc.right - rc.left) <= 1 || (rc.bottom - rc.top) <= 1) return TRUE;
 
     if (rc.right <= g_state.screenLeft || rc.bottom <= g_state.screenTop ||
@@ -533,4 +540,20 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
 
     CleanupMem();
     return resultBmp;
+}
+
+HBITMAP SnipOverlay::CaptureFullScreenBitmap() {
+    g_state = {};
+    if (!CaptureFullScreen()) {
+        return nullptr;
+    }
+    // Transfer ownership of the bitmap out; detach from memDC
+    HBITMAP result = g_state.memBmp;
+    // Prevent CleanupMem from deleting it
+    SelectObject(g_state.memDC, g_state.oldBmp);
+    DeleteDC(g_state.memDC);
+    g_state.memDC = nullptr;
+    g_state.memBmp = nullptr;
+    g_state.oldBmp = nullptr;
+    return result;
 }

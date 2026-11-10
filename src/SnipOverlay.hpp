@@ -3,8 +3,9 @@
 
 class SnipOverlay {
 public:
-    // Shows dimmed fullscreen overlay, lets user select region with mouse.
-    // Returns HBITMAP of the selected area (caller must DeleteObject), or nullptr on cancel.
-    // selected receives the screen coordinates of the selection.
+    // Shows dimmed overlay, user selects region. Returns HBITMAP of selection (caller DeleteObject) or nullptr.
     static HBITMAP CaptureRegion(HINSTANCE hInstance, RECT& selected);
+
+    // Captures entire virtual screen without overlay/editor. Caller must DeleteObject.
+    static HBITMAP CaptureFullScreenBitmap();
 };
