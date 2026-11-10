@@ -20,8 +20,8 @@ constexpr int MARGIN_Y_TOP = 6;
 constexpr int IMAGE_OFFSET_X = 8;
 constexpr int IMAGE_OFFSET_Y = TOOLBAR_H + 8;
 
-// FIX: Минимальные размеры окна, чтобы влезала вся панель инструментов
-constexpr int MIN_WIN_W = 760; 
+// Минимальные размеры окна, чтобы влезала вся панель инструментов
+constexpr int MIN_WIN_W = 760;
 constexpr int MIN_WIN_H = 200;
 
 bool GetBitmapData(HBITMAP hBmp, int& w, int& h, std::vector<uint8_t>& pixelsBGRA) {
@@ -53,18 +53,6 @@ POINT GetImagePoint(LPARAM lParam) {
 
 } // namespace
 
-// Инициализация статического массива цветов палитры
-/*
-constexpr COLORREF ImageEditor::paletteColors_[6] = {
-    RGB(255, 0, 0),    // Red
-    RGB(0, 255, 0),    // Green
-    RGB(0, 0, 255),    // Blue
-    RGB(255, 255, 0),  // Yellow
-    RGB(0, 0, 0),      // Black
-    RGB(255, 255, 255) // White
-};
-*/
-
 ImageEditor::ImageEditor(HINSTANCE hInstance, HBITMAP hSourceBmp, const RECT& screenRect)
     : hInst_(hInstance), screenRect_(screenRect)
 {
@@ -91,7 +79,7 @@ ImageEditor::ImageEditor(HINSTANCE hInstance, HBITMAP hSourceBmp, const RECT& sc
     hdcCanvas_ = CreateCompatibleDC(nullptr);
     hCanvas_ = CreateCompatibleBitmap(screenDC, imgW_, imgH_);
     hOldCanvas_ = (HBITMAP)SelectObject(hdcCanvas_, hCanvas_);
-    
+
     RebuildCanvas();
 }
 
@@ -149,7 +137,7 @@ void ImageEditor::CreateControls() {
     btnFree_  = makeBtn(L"Pencil",   MARGIN_X, 1001);
     btnLine_  = makeBtn(L"Line",     MARGIN_X + 1 * (BTN_W + 6), 1002);
     btnRect_  = makeBtn(L"Rect",     MARGIN_X + 2 * (BTN_W + 6), 1003);
-    btnColor_ = makeBtn(L"More...",  MARGIN_X + 3 * (BTN_W + 6), 1004); // Переименовали для ясности
+    btnColor_ = makeBtn(L"More...",  MARGIN_X + 3 * (BTN_W + 6), 1004);
     btnUndo_  = makeBtn(L"Undo",     MARGIN_X + 4 * (BTN_W + 6), 1005);
     btnCopy_  = makeBtn(L"Copy",     MARGIN_X + 5 * (BTN_W + 6), 1006);
     btnSave_  = makeBtn(L"Save PNG", MARGIN_X + 6 * (BTN_W + 6), 1007);
@@ -169,18 +157,16 @@ void ImageEditor::OnPaint(HDC hdc) {
 
     BitBlt(hdc, IMAGE_OFFSET_X, IMAGE_OFFSET_Y, imgW_, imgH_, hdcCanvas_, 0, 0, SRCCOPY);
 
-    // FIX: Отрисовка палитры быстрых цветов
+    // Отрисовка палитры быстрых цветов
     int px = MARGIN_X + PALETTE_BTN_OFFSET * (BTN_W + 6);
     int py = MARGIN_Y_TOP;
     for (int i = 0; i < 6; ++i) {
         RECT rc{ px + i * 28, py, px + i * 28 + 24, py + 24 };
-        
-        // Заливка цветом
+
         HBRUSH hBrush = CreateSolidBrush(paletteColors_[i]);
         FillRect(hdc, &rc, hBrush);
         DeleteObject(hBrush);
 
-        // Рамка
         HPEN pen = CreatePen(PS_SOLID, 1, RGB(150, 150, 150));
         HPEN oldPen = (HPEN)SelectObject(hdc, pen);
         HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
@@ -189,7 +175,6 @@ void ImageEditor::OnPaint(HDC hdc) {
         SelectObject(hdc, oldPen);
         DeleteObject(pen);
 
-        // Подсветка активного цвета
         if (currentColor_ == paletteColors_[i]) {
             HPEN selPen = CreatePen(PS_SOLID, 2, RGB(0, 120, 215));
             HPEN oldSel = (HPEN)SelectObject(hdc, selPen);
@@ -258,12 +243,11 @@ void ImageEditor::EndStroke(POINT pt) {
         currentStroke_.points.push_back(pt);
         strokes_.push_back(std::move(currentStroke_));
     }
-    
+
     RebuildCanvas();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-// FIX: Добавлен параметр showNotification
 void ImageEditor::CopyToClipboard(bool showNotification) {
     if (!OpenClipboard(hwnd_)) return;
     EmptyClipboard();
@@ -278,12 +262,11 @@ void ImageEditor::CopyToClipboard(bool showNotification) {
     ReleaseDC(nullptr, screenDC);
 
     SetClipboardData(CF_BITMAP, hCopy);
-    
-    // Поддержка CF_DIB для современных приложений
+
     int w = 0, h = 0;
     std::vector<uint8_t> bgra;
     if (GetBitmapData(hCopy, w, h, bgra)) {
-        size_t dibSize = sizeof(BITMAPV5HEADER) + w * h * 4;
+        size_t dibSize = sizeof(BITMAPV5HEADER) + static_cast<size_t>(w) * h * 4;
         HGLOBAL hDIB = GlobalAlloc(GMEM_MOVEABLE, dibSize);
         if (hDIB) {
             auto* pDIB = reinterpret_cast<BITMAPV5HEADER*>(GlobalLock(hDIB));
@@ -293,11 +276,11 @@ void ImageEditor::CopyToClipboard(bool showNotification) {
             pDIB->bV5Planes = 1;
             pDIB->bV5BitCount = 32;
             pDIB->bV5Compression = BI_RGB;
-            pDIB->bV5SizeImage = w * h * 4;
-            
+            pDIB->bV5SizeImage = static_cast<DWORD>(w) * h * 4;
+
             uint8_t* pixelsDest = reinterpret_cast<uint8_t*>(pDIB) + sizeof(BITMAPV5HEADER);
-            memcpy(pixelsDest, bgra.data(), w * h * 4);
-            
+            memcpy(pixelsDest, bgra.data(), bgra.size());
+
             GlobalUnlock(hDIB);
             SetClipboardData(CF_DIB, hDIB);
         }
@@ -344,7 +327,7 @@ void ImageEditor::SaveToFile() {
     std::transform(wpath.begin(), wpath.end(), wpath.begin(), ::towlower);
     bool isBmp = (wpath.length() >= 4) && (wpath.compare(wpath.length() - 4, 4, L".bmp") == 0);
 
-    int ok = isBmp ? stbi_write_bmp(pathUtf8, w, h, 4, rgba.data()) 
+    int ok = isBmp ? stbi_write_bmp(pathUtf8, w, h, 4, rgba.data())
                    : stbi_write_png(pathUtf8, w, h, 4, rgba.data(), w * 4);
 
     if (ok) {
@@ -386,33 +369,31 @@ LRESULT ImageEditor::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
         case 1005: Undo(); break;
-        case 1006: CopyToClipboard(true); break; // FIX: Показываем уведомление при ручном нажатии
+        case 1006: CopyToClipboard(true); break;
         case 1007: SaveToFile(); break;
         }
         UpdateToolButtons();
-        InvalidateRect(hwnd_, nullptr, FALSE); // Перерисовать палитру при смене цвета
+        InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
     }
 
     case WM_LBUTTONDOWN: {
-        // FIX: Обработка клика по палитре цветов
         int mx = GET_X_LPARAM(lParam);
         int my = GET_Y_LPARAM(lParam);
         int px = MARGIN_X + PALETTE_BTN_OFFSET * (BTN_W + 6);
         int py = MARGIN_Y_TOP;
-        
+
         if (my >= py && my <= py + 24) {
             for (int i = 0; i < 6; ++i) {
                 if (mx >= px + i * 28 && mx <= px + i * 28 + 24) {
                     currentColor_ = paletteColors_[i];
                     RECT inv{ 0, 0, imgW_ + 16, TOOLBAR_H };
                     InvalidateRect(hwnd_, &inv, FALSE);
-                    return 0; // Прерываем, чтобы не начать рисовать
+                    return 0;
                 }
             }
         }
 
-        // Стандартная логика начала рисования
         POINT pt = GetImagePoint(lParam);
         if (pt.x >= 0 && pt.y >= 0 && pt.x < imgW_ && pt.y < imgH_) {
             StartStroke(pt);
@@ -424,9 +405,9 @@ LRESULT ImageEditor::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_MOUSEMOVE: {
         if (drawing_) {
             POINT pt = GetImagePoint(lParam);
-            pt.x = std::max(0, std::min(imgW_ - 1, pt.x));
-            pt.y = std::max(0, std::min(imgH_ - 1, pt.y));
-            ContinueStroke(pt);
+            int px = std::max(0, std::min(imgW_ - 1, static_cast<int>(pt.x)));
+            int py = std::max(0, std::min(imgH_ - 1, static_cast<int>(pt.y)));
+            ContinueStroke({ px, py });
         }
         return 0;
     }
@@ -434,9 +415,9 @@ LRESULT ImageEditor::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_LBUTTONUP: {
         if (drawing_) {
             POINT pt = GetImagePoint(lParam);
-            pt.x = std::max(0, std::min(imgW_ - 1, pt.x));
-            pt.y = std::max(0, std::min(imgH_ - 1, pt.y));
-            EndStroke(pt);
+            int px = std::max(0, std::min(imgW_ - 1, static_cast<int>(pt.x)));
+            int py = std::max(0, std::min(imgH_ - 1, static_cast<int>(pt.y)));
+            EndStroke({ px, py });
             ReleaseCapture();
         }
         return 0;
@@ -525,18 +506,21 @@ void ImageEditor::Run() {
     wc.lpszClassName = L"SnipEditorClass";
     RegisterClassExW(&wc);
 
-    // FIX: Гарантируем минимальный размер окна
     int winW = std::max(MIN_WIN_W, imgW_ + 24);
     int winH = std::max(MIN_WIN_H, imgH_ + TOOLBAR_H + 48);
 
     int x = screenRect_.left + (screenRect_.right - screenRect_.left - winW) / 2;
     int y = screenRect_.top  + (screenRect_.bottom - screenRect_.top - winH) / 2;
 
-    // FIX: Ограничиваем координаты, чтобы окно не улетело за пределы экрана
     RECT workArea;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
-    x = std::max(workArea.left, std::min(x, workArea.right - winW));
-    y = std::max(workArea.top, std::min(y, workArea.bottom - winH));
+    int workLeft   = static_cast<int>(workArea.left);
+    int workTop    = static_cast<int>(workArea.top);
+    int workRight  = static_cast<int>(workArea.right);
+    int workBottom = static_cast<int>(workArea.bottom);
+
+    x = std::max(workLeft, std::min(x, workRight - winW));
+    y = std::max(workTop, std::min(y, workBottom - winH));
 
     hwnd_ = CreateWindowExW(
         WS_EX_TOOLWINDOW,
@@ -551,7 +535,7 @@ void ImageEditor::Run() {
     UpdateWindow(hwnd_);
     SetForegroundWindow(hwnd_);
 
-    // FIX: Автоматическое копирование в буфер обмена при создании (без уведомления)
+    // Автоматическое копирование в буфер обмена при создании (без уведомления)
     CopyToClipboard(false);
 
     MSG msg{};

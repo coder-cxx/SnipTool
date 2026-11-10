@@ -62,7 +62,6 @@ private:
     void StartStroke(POINT pt);
     void ContinueStroke(POINT pt);
     void EndStroke(POINT pt);
-    
     void CopyToClipboard(bool showNotification = true);
     void SaveToFile();
     void Undo();
@@ -70,8 +69,6 @@ private:
 
     // Палитра
     static constexpr int PALETTE_BTN_OFFSET = 7;
-    
-    // FIX: inline static constexpr с инициализацией прямо здесь
     inline static constexpr COLORREF paletteColors_[6] = {
         RGB(255, 0, 0),    // Red
         RGB(0, 255, 0),    // Green
