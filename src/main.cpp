@@ -6,6 +6,9 @@
 
 #include "SnipOverlay.hpp"
 #include "ImageEditor.hpp"
+
+// from ImageEditor.cpp
+void PutBitmapToClipboard(HBITMAP hBmp);
 #include "resource.h"
 
 constexpr int HOTKEY_ID = 1;
@@ -51,6 +54,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             RECT selected{};
             HBITMAP hBmp = SnipOverlay::CaptureRegion(g_hInstance, selected);
             if (hBmp) {
+                // Immediately put the raw capture into clipboard
+                // (so it is ready even before any drawing)
+                PutBitmapToClipboard(hBmp);
+
                 ImageEditor editor(g_hInstance, hBmp, selected);
                 editor.Run();
                 DeleteObject(hBmp);

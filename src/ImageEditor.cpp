@@ -70,7 +70,7 @@ ImageEditor::ImageEditor(HINSTANCE hInstance, HBITMAP hSourceBmp, const RECT& sc
 }
 
 ImageEditor::~ImageEditor() {
-    // Auto-copy final image (with drawings) to clipboard on close
+    // Final safety copy (already updated after each stroke)
     CopyToClipboard();
 
     if (hdcCanvas_) {
@@ -268,23 +268,125 @@ void ImageEditor::EndStroke(POINT pt) {
         RebuildCanvas();
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
+
+    // Update clipboard after every completed drawing operation
+    CopyToClipboard();
+}
+
+// Free helper: put any HBITMAP to clipboard with max compatibility
+void PutBitmapToClipboard(HBITMAP hBmp) {
+    if (!hBmp) return;
+    if (!OpenClipboard(nullptr)) return;
+    EmptyClipboard();
+
+    BITMAP bm{};
+    if (!GetObject(hBmp, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) {
+        CloseClipboard();
+        return;
+    }
+
+    // 1. CF_DIB
+    {
+        BITMAPINFOHEADER bi{};
+        bi.biSize = sizeof(BITMAPINFOHEADER);
+        bi.biWidth = bm.bmWidth;
+        bi.biHeight = bm.bmHeight; // bottom-up
+        bi.biPlanes = 1;
+        bi.biBitCount = 32;
+        bi.biCompression = BI_RGB;
+
+        const size_t headerSize = sizeof(BITMAPINFOHEADER);
+        const size_t imageSize = static_cast<size_t>(bm.bmWidth) * bm.bmHeight * 4;
+        const size_t totalSize = headerSize + imageSize;
+
+        HGLOBAL hDib = GlobalAlloc(GMEM_MOVEABLE, totalSize);
+        if (hDib) {
+            void* p = GlobalLock(hDib);
+            if (p) {
+                memcpy(p, &bi, headerSize);
+                BITMAPINFO bmi{};
+                bmi.bmiHeader = bi;
+                HDC hdc = GetDC(nullptr);
+                GetDIBits(hdc, hBmp, 0, bm.bmHeight,
+                          static_cast<BYTE*>(p) + headerSize, &bmi, DIB_RGB_COLORS);
+                ReleaseDC(nullptr, hdc);
+                GlobalUnlock(hDib);
+                SetClipboardData(CF_DIB, hDib);
+            } else {
+                GlobalFree(hDib);
+            }
+        }
+    }
+
+    // 2. PNG
+    {
+        UINT pngFmt = RegisterClipboardFormatA("PNG");
+        if (pngFmt) {
+            // Get top-down BGRA
+            BITMAPINFOHEADER bi{};
+            bi.biSize = sizeof(BITMAPINFOHEADER);
+            bi.biWidth = bm.bmWidth;
+            bi.biHeight = -bm.bmHeight; // top-down
+            bi.biPlanes = 1;
+            bi.biBitCount = 32;
+            bi.biCompression = BI_RGB;
+
+            std::vector<uint8_t> bgra(static_cast<size_t>(bm.bmWidth) * bm.bmHeight * 4);
+            BITMAPINFO bmi{};
+            bmi.bmiHeader = bi;
+            HDC hdc = GetDC(nullptr);
+            GetDIBits(hdc, hBmp, 0, bm.bmHeight, bgra.data(), &bmi, DIB_RGB_COLORS);
+            ReleaseDC(nullptr, hdc);
+
+            std::vector<uint8_t> rgba(bgra.size());
+            for (size_t i = 0; i < bgra.size() / 4; ++i) {
+                rgba[i*4 + 0] = bgra[i*4 + 2];
+                rgba[i*4 + 1] = bgra[i*4 + 1];
+                rgba[i*4 + 2] = bgra[i*4 + 0];
+                rgba[i*4 + 3] = 255;
+            }
+
+            int pngLen = 0;
+            unsigned char* pngData = stbi_write_png_to_mem(rgba.data(), bm.bmWidth * 4, bm.bmWidth, bm.bmHeight, 4, &pngLen);
+            if (pngData && pngLen > 0) {
+                HGLOBAL hPng = GlobalAlloc(GMEM_MOVEABLE, pngLen);
+                if (hPng) {
+                    void* p = GlobalLock(hPng);
+                    if (p) {
+                        memcpy(p, pngData, pngLen);
+                        GlobalUnlock(hPng);
+                        SetClipboardData(pngFmt, hPng);
+                    } else {
+                        GlobalFree(hPng);
+                    }
+                }
+                STBIW_FREE(pngData);
+            }
+        }
+    }
+
+    // 3. CF_BITMAP
+    {
+        HDC screenDC = GetDC(nullptr);
+        HDC tmpDC = CreateCompatibleDC(screenDC);
+        HBITMAP hCopy = CreateCompatibleBitmap(screenDC, bm.bmWidth, bm.bmHeight);
+        HBITMAP oldBmp = (HBITMAP)SelectObject(tmpDC, hCopy);
+        HDC srcDC = CreateCompatibleDC(screenDC);
+        HBITMAP oldSrc = (HBITMAP)SelectObject(srcDC, hBmp);
+        BitBlt(tmpDC, 0, 0, bm.bmWidth, bm.bmHeight, srcDC, 0, 0, SRCCOPY);
+        SelectObject(srcDC, oldSrc);
+        DeleteDC(srcDC);
+        SelectObject(tmpDC, oldBmp);
+        DeleteDC(tmpDC);
+        ReleaseDC(nullptr, screenDC);
+        SetClipboardData(CF_BITMAP, hCopy);
+    }
+
+    CloseClipboard();
 }
 
 void ImageEditor::CopyToClipboard() {
-    if (!OpenClipboard(hwnd_)) return;
-    EmptyClipboard();
-
-    HDC screenDC = GetDC(nullptr);
-    HDC tmpDC = CreateCompatibleDC(screenDC);
-    HBITMAP hCopy = CreateCompatibleBitmap(screenDC, imgW_, imgH_);
-    HBITMAP old = (HBITMAP)SelectObject(tmpDC, hCopy);
-    BitBlt(tmpDC, 0, 0, imgW_, imgH_, hdcCanvas_, 0, 0, SRCCOPY);
-    SelectObject(tmpDC, old);
-    DeleteDC(tmpDC);
-    ReleaseDC(nullptr, screenDC);
-
-    SetClipboardData(CF_BITMAP, hCopy);
-    CloseClipboard();
+    PutBitmapToClipboard(hCanvas_);
 }
 
 void ImageEditor::SaveToFile() {
@@ -335,6 +437,9 @@ void ImageEditor::Undo() {
     strokes_.pop_back();
     RebuildCanvas();
     InvalidateRect(hwnd_, nullptr, FALSE);
+
+    // Keep clipboard in sync with current state (including after undo)
+    CopyToClipboard();
 }
 
 LRESULT ImageEditor::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -536,6 +641,10 @@ LRESULT ImageEditor::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (wParam == 'Z' && (GetKeyState(VK_CONTROL) & 0x8000)) {
             Undo();
         }
+        return 0;
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd_);
         return 0;
 
     case WM_DESTROY:

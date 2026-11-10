@@ -81,3 +81,7 @@ private:
     void Undo();
     void DrawArrow(HDC hdc, POINT from, POINT to, int thickness, COLORREF color);
 };
+
+// Puts HBITMAP to clipboard in CF_DIB + PNG + CF_BITMAP formats
+void PutBitmapToClipboard(HBITMAP hBmp);
+
