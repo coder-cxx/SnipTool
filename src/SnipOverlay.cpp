@@ -6,7 +6,6 @@
 #include <vector>
 #include <string>
 
-// Флаг для PrintWindow, заставляющий рендерить полное содержимое (игнорирует оверлеи)
 #ifndef PW_RENDERFULLCONTENT
 #define PW_RENDERFULLCONTENT 0x00000002
 #endif
@@ -44,7 +43,6 @@ void CleanupMem() {
     }
 }
 
-// Проверяет, является ли окно ватермаркой/оверлеем, который нужно игнорировать
 bool IsWatermarkWindow(HWND hwnd) {
     if (!hwnd) return true;
     
@@ -56,8 +54,6 @@ bool IsWatermarkWindow(HWND hwnd) {
     std::wstring cls(className);
     std::wstring title(windowName);
 
-    // ДОБАВЬТЕ СЮДА КЛАСС ИЛИ ИМЯ ВАШЕЙ ВАТЕРМАРКИ, если знаете его
-    // Например, если ватермарка имеет класс "WatermarkClass" или заголовок "Activate"
     const std::vector<std::wstring> blacklist = {
         L"Watermark", L"Overlay", L"ActivateWindows", L"GameBar", 
         L"Xbox", L"Toast", L"Notification", L"SnipOverlayClass"
@@ -71,25 +67,20 @@ bool IsWatermarkWindow(HWND hwnd) {
     return false;
 }
 
-// Структура для хранения информации об окне
 struct WindowInfo {
     HWND hwnd;
     RECT rect;
 };
 
-// Callback для EnumWindows - собирает все видимые окна
 BOOL CALLBACK CollectWindows(HWND hwnd, LPARAM lParam) {
     if (!IsWindowVisible(hwnd)) return TRUE;
-    if (IsWatermarkWindow(hwnd)) return TRUE; // Пропускаем ватермарку!
-    if (hwnd == g_state.hwnd) return TRUE; // Пропускаем наш собственный оверлей
-    
-    // Пропускаем системные оболочки
+    if (IsWatermarkWindow(hwnd)) return TRUE;
+    if (hwnd == g_state.hwnd) return TRUE;
     if (hwnd == GetShellWindow()) return TRUE;
     
     wchar_t cls[256] = {0};
     GetClassNameW(hwnd, cls, 256);
     
-    // Пропускаем рабочий стол и панель задач (их захватим отдельно)
     if (wcscmp(cls, L"Progman") == 0 || 
         wcscmp(cls, L"WorkerW") == 0 || 
         wcscmp(cls, L"Shell_TrayWnd") == 0 ||
@@ -100,7 +91,6 @@ BOOL CALLBACK CollectWindows(HWND hwnd, LPARAM lParam) {
     RECT rc;
     if (!GetWindowRect(hwnd, &rc)) return TRUE;
     
-    // Пропускаем окна за пределами экрана или минимизированные
     if (rc.left >= g_state.screenW + g_state.screenLeft || 
         rc.top >= g_state.screenH + g_state.screenTop || 
         rc.right <= g_state.screenLeft || 
@@ -114,25 +104,62 @@ BOOL CALLBACK CollectWindows(HWND hwnd, LPARAM lParam) {
     auto& windows = *reinterpret_cast<std::vector<WindowInfo>*>(lParam);
     windows.push_back({hwnd, rc});
     
-    return TRUE; // Продолжаем перечисление
+    return TRUE;
 }
 
-// Захватывает фон рабочего стола (обои)
-void CaptureDesktopBackground() {
-    // Заполняем базовым цветом
-    HBRUSH hBrush = CreateSolidBrush(RGB(30, 30, 30));
-    RECT rc = {0, 0, g_state.screenW, g_state.screenH};
-    FillRect(g_state.memDC, &rc, hBrush);
-    DeleteObject(hBrush);
+// Проверяет, есть ли в битмапе непустые пиксели
+bool HasContent(HBITMAP hBmp, HDC hdc, int width, int height) {
+    BITMAPINFO bi{ sizeof(BITMAPINFOHEADER) };
+    bi.bmiHeader.biWidth = width;
+    bi.bmiHeader.biHeight = -height;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
 
-    // Пытаемся захватить реальный рабочий стол через PrintWindow
-    HWND hDesktop = GetDesktopWindow();
-    if (hDesktop) {
-        PrintWindow(hDesktop, g_state.memDC, PW_RENDERFULLCONTENT);
+    std::vector<uint32_t> pixels((size_t)width * height);
+    GetDIBits(hdc, hBmp, 0, height, pixels.data(), (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+
+    // Проверяем хотя бы 1% пикселей
+    size_t sampleSize = pixels.size() / 100;
+    if (sampleSize == 0) sampleSize = 1;
+    
+    for (size_t i = 0; i < sampleSize; ++i) {
+        if (pixels[i] & 0x00FFFFFF) return true; // Есть ненулевой RGB
     }
+    return false;
 }
 
-// Рисует одно окно на общем холсте
+// Гибридный захват: сначала PrintWindow, если пусто - BitBlt
+HBITMAP CaptureWindowContent(HWND hwnd, int width, int height) {
+    HDC hdcScreen = GetDC(nullptr);
+    HDC memDC = CreateCompatibleDC(hdcScreen);
+    HBITMAP hBmp = CreateCompatibleBitmap(hdcScreen, width, height);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, hBmp);
+
+    // Попытка 1: PrintWindow (чистый захват, без оверлеев)
+    BOOL pwSuccess = PrintWindow(hwnd, memDC, PW_RENDERFULLCONTENT);
+    
+    bool hasContent = false;
+    if (pwSuccess) {
+        hasContent = HasContent(hBmp, memDC, width, height);
+    }
+
+    // Попытка 2: Если PrintWindow дал пустой результат - используем BitBlt (для GPU-приложений)
+    if (!hasContent) {
+        HDC hdcWindow = GetDC(hwnd);
+        if (hdcWindow) {
+            BitBlt(memDC, 0, 0, width, height, hdcWindow, 0, 0, SRCCOPY | CAPTUREBLT);
+            ReleaseDC(hwnd, hdcWindow);
+        }
+    }
+
+    SelectObject(memDC, oldBmp);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, hdcScreen);
+
+    return hBmp;
+}
+
 void DrawWindowToCanvas(const WindowInfo& winInfo) {
     HWND hwnd = winInfo.hwnd;
     const RECT& rc = winInfo.rect;
@@ -140,64 +167,52 @@ void DrawWindowToCanvas(const WindowInfo& winInfo) {
     int width = rc.right - rc.left;
     int height = rc.bottom - rc.top;
 
-    // Создаём временный DC для этого окна
+    HBITMAP hBmpWindow = CaptureWindowContent(hwnd, width, height);
+    if (!hBmpWindow) return;
+
+    int drawX = rc.left - g_state.screenLeft;
+    int drawY = rc.top - g_state.screenTop;
+
+    if (drawX < 0 || drawY < 0 || drawX >= g_state.screenW || drawY >= g_state.screenH) {
+        DeleteObject(hBmpWindow);
+        return;
+    }
+
+    int drawW = (std::min)(width, g_state.screenW - drawX);
+    int drawH = (std::min)(height, g_state.screenH - drawY);
+
     HDC hdcWindow = GetDC(hwnd);
-    if (!hdcWindow) return;
-    
     HDC memDCWindow = CreateCompatibleDC(hdcWindow);
-    if (!memDCWindow) {
-        ReleaseDC(hwnd, hdcWindow);
-        return;
-    }
-    
-    HBITMAP hBmpWindow = CreateCompatibleBitmap(hdcWindow, width, height);
-    if (!hBmpWindow) {
-        DeleteDC(memDCWindow);
-        ReleaseDC(hwnd, hdcWindow);
-        return;
-    }
-    
     HBITMAP oldBmp = (HBITMAP)SelectObject(memDCWindow, hBmpWindow);
 
-    // КЛЮЧЕВОЙ МОМЕНТ: PW_RENDERFULLCONTENT просит окно отрендерить себя "чисто",
-    // без наложенных сверху DWM-оверлеев.
-    BOOL success = PrintWindow(hwnd, memDCWindow, PW_RENDERFULLCONTENT);
-    
-    if (!success) {
-        // Fallback на обычный BitBlt, если PrintWindow не сработал
-        BitBlt(memDCWindow, 0, 0, width, height, hdcWindow, 0, 0, SRCCOPY);
-        success = TRUE;
-    }
-    
-    if (success) {
-        // Рисуем это "чистое" окно на наш главный холст (g_state.memDC)
-        // С учётом его позиции на виртуальном экране
-        int drawX = rc.left - g_state.screenLeft;
-        int drawY = rc.top - g_state.screenTop;
-        
-        // Проверяем, не выходит ли окно за границы холста
-        if (drawX < 0 || drawY < 0 || drawX >= g_state.screenW || drawY >= g_state.screenH) {
-            SelectObject(memDCWindow, oldBmp);
-            DeleteObject(hBmpWindow);
-            DeleteDC(memDCWindow);
-            ReleaseDC(hwnd, hdcWindow);
-            return;
-        }
-        
-        // Ограничиваем размеры, если окно выходит за границы
-        int drawW = (std::min)(width, g_state.screenW - drawX);
-        int drawH = (std::min)(height, g_state.screenH - drawY);
-        
-        // Используем AlphaBlend для поддержки полупрозрачности
+    // Проверяем, есть ли альфа-канал
+    LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    bool isLayered = (exStyle & WS_EX_LAYERED) != 0;
+
+    if (isLayered) {
         BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
         AlphaBlend(g_state.memDC, drawX, drawY, drawW, drawH, 
                    memDCWindow, 0, 0, drawW, drawH, bf);
+    } else {
+        BitBlt(g_state.memDC, drawX, drawY, drawW, drawH, memDCWindow, 0, 0, SRCCOPY);
     }
 
     SelectObject(memDCWindow, oldBmp);
-    DeleteObject(hBmpWindow);
     DeleteDC(memDCWindow);
     ReleaseDC(hwnd, hdcWindow);
+    DeleteObject(hBmpWindow);
+}
+
+void CaptureDesktopBackground() {
+    HBRUSH hBrush = CreateSolidBrush(RGB(30, 30, 30));
+    RECT rc = {0, 0, g_state.screenW, g_state.screenH};
+    FillRect(g_state.memDC, &rc, hBrush);
+    DeleteObject(hBrush);
+
+    HWND hDesktop = GetDesktopWindow();
+    if (hDesktop) {
+        PrintWindow(hDesktop, g_state.memDC, PW_RENDERFULLCONTENT);
+    }
 }
 
 bool CaptureFullScreen() {
@@ -214,17 +229,13 @@ bool CaptureFullScreen() {
     g_state.memBmp = CreateCompatibleBitmap(screenDC, g_state.screenW, g_state.screenH);
     g_state.oldBmp = (HBITMAP)SelectObject(g_state.memDC, g_state.memBmp);
 
-    // 1. Захватываем фон рабочего стола (обои)
     CaptureDesktopBackground();
 
-    // 2. Собираем все видимые окна (EnumWindows идёт от верхнего к нижнему)
     std::vector<WindowInfo> windows;
     EnumWindows(CollectWindows, reinterpret_cast<LPARAM>(&windows));
 
-    // 3. Переворачиваем список, чтобы рисовать снизу вверх (правильный Z-порядок)
     std::reverse(windows.begin(), windows.end());
 
-    // 4. Послойно рисуем все окна на холст
     for (const auto& winInfo : windows) {
         DrawWindowToCanvas(winInfo);
     }
@@ -233,12 +244,11 @@ bool CaptureFullScreen() {
     return g_state.memBmp != nullptr;
 }
 
-// Create a 32-bit ARGB dibsection for layered window
 HBITMAP CreateARGBSurface(int w, int h, void** bits) {
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -h; // top-down
+    bmi.bmiHeader.biHeight = -h;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -254,7 +264,6 @@ void UpdateLayeredContent(HWND hwnd) {
     HBITMAP argbBmp = CreateARGBSurface(g_state.screenW, g_state.screenH, &bits);
     if (!argbBmp || !bits) return;
 
-    // Copy original screenshot into ARGB (BGRX -> BGRA with full alpha)
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = g_state.screenW;
@@ -270,16 +279,14 @@ void UpdateLayeredContent(HWND hwnd) {
     uint8_t* p = static_cast<uint8_t*>(bits);
     const int total = g_state.screenW * g_state.screenH;
 
-    // Darken everything (aggressive ~70% black overlay)
     for (int i = 0; i < total; ++i) {
-        p[0] = static_cast<uint8_t>(p[0] * 0.30); // B
-        p[1] = static_cast<uint8_t>(p[1] * 0.30); // G
-        p[2] = static_cast<uint8_t>(p[2] * 0.30); // R
-        p[3] = 255; // A
+        p[0] = static_cast<uint8_t>(p[0] * 0.30);
+        p[1] = static_cast<uint8_t>(p[1] * 0.30);
+        p[2] = static_cast<uint8_t>(p[2] * 0.30);
+        p[3] = 255;
         p += 4;
     }
 
-    // Restore original brightness inside selection rectangle
     if (g_state.selecting || g_state.finished) {
         int x1 = (std::min)(g_state.start.x, g_state.current.x);
         int y1 = (std::min)(g_state.start.y, g_state.current.y);
@@ -305,7 +312,6 @@ void UpdateLayeredContent(HWND hwnd) {
             }
         }
 
-        // Draw selection border
         auto setPixel = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
             if (x < 0 || y < 0 || x >= g_state.screenW || y >= g_state.screenH) return;
             int idx = (y * g_state.screenW + x) * 4;
