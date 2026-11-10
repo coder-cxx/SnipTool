@@ -5,23 +5,18 @@
 #include <commdlg.h>
 #include <vector>
 #include <algorithm>
-#include <cstdint>
+#include <cmath>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
 namespace {
 
-constexpr int TOOLBAR_H = 40;
-constexpr int BTN_W = 90;
-constexpr int BTN_H = 28;
-constexpr int MARGIN_X = 8;
-constexpr int MARGIN_Y_TOP = 6;
-constexpr int IMAGE_OFFSET_X = 8;
-constexpr int IMAGE_OFFSET_Y = TOOLBAR_H + 8;
-
-constexpr int MIN_WIN_W = 760;
-constexpr int MIN_WIN_H = 200;
+constexpr int TOOLBAR_H = 36;
+constexpr int BTN_W = 64;
+constexpr int BTN_H = 24;
+constexpr int PALETTE_SIZE = 20;
+constexpr int MARGIN = 8;
 
 bool GetBitmapData(HBITMAP hBmp, int& w, int& h, std::vector<uint8_t>& pixelsBGRA) {
     BITMAP bm{};
@@ -31,23 +26,16 @@ bool GetBitmapData(HBITMAP hBmp, int& w, int& h, std::vector<uint8_t>& pixelsBGR
 
     BITMAPINFOHEADER bi{ sizeof(bi) };
     bi.biWidth = w;
-    bi.biHeight = -h;
+    bi.biHeight = -h; // top-down
     bi.biPlanes = 1;
     bi.biBitCount = 32;
     bi.biCompression = BI_RGB;
 
-    pixelsBGRA.resize(w * h * 4);
+    pixelsBGRA.resize(static_cast<size_t>(w) * h * 4);
     HDC hdc = GetDC(nullptr);
     int res = GetDIBits(hdc, hBmp, 0, h, pixelsBGRA.data(), (BITMAPINFO*)&bi, DIB_RGB_COLORS);
     ReleaseDC(nullptr, hdc);
     return res != 0;
-}
-
-POINT GetImagePoint(LPARAM lParam) {
-    POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-    pt.x -= IMAGE_OFFSET_X;
-    pt.y -= IMAGE_OFFSET_Y;
-    return pt;
 }
 
 } // namespace
@@ -61,8 +49,6 @@ ImageEditor::ImageEditor(HINSTANCE hInstance, HBITMAP hSourceBmp, const RECT& sc
     imgH_ = bm.bmHeight;
 
     HDC screenDC = GetDC(nullptr);
-    
-    // Копируем исходный битмап
     HDC srcDC = CreateCompatibleDC(screenDC);
     HBITMAP oldSrc = (HBITMAP)SelectObject(srcDC, hSourceBmp);
 
@@ -76,23 +62,61 @@ ImageEditor::ImageEditor(HINSTANCE hInstance, HBITMAP hSourceBmp, const RECT& sc
     SelectObject(srcDC, oldSrc);
     DeleteDC(srcDC);
 
-    // ИСПРАВЛЕНО: Создаем canvas ДО освобождения screenDC
     hdcCanvas_ = CreateCompatibleDC(screenDC);
     hCanvas_ = CreateCompatibleBitmap(screenDC, imgW_, imgH_);
-    hOldCanvas_ = (HBITMAP)SelectObject(hdcCanvas_, hCanvas_);
-
     ReleaseDC(nullptr, screenDC);
-
+    hOldCanvas_ = (HBITMAP)SelectObject(hdcCanvas_, hCanvas_);
     RebuildCanvas();
 }
 
 ImageEditor::~ImageEditor() {
+    // Auto-copy final image (with drawings) to clipboard on close
+    CopyToClipboard();
+
     if (hdcCanvas_) {
         SelectObject(hdcCanvas_, hOldCanvas_);
         DeleteDC(hdcCanvas_);
     }
     if (hCanvas_) DeleteObject(hCanvas_);
     if (hOriginal_) DeleteObject(hOriginal_);
+}
+
+void ImageEditor::DrawArrow(HDC hdc, POINT from, POINT to, int thickness, COLORREF color) {
+    HPEN pen = CreatePen(PS_SOLID, thickness, color);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    HBRUSH brush = CreateSolidBrush(color);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
+
+    MoveToEx(hdc, from.x, from.y, nullptr);
+    LineTo(hdc, to.x, to.y);
+
+    // Arrow head
+    double dx = static_cast<double>(to.x - from.x);
+    double dy = static_cast<double>(to.y - from.y);
+    double len = std::sqrt(dx * dx + dy * dy);
+    if (len > 1.0) {
+        dx /= len; dy /= len;
+        const double headLen = (std::max)(12.0, thickness * 4.0);
+        const double headWidth = headLen * 0.5;
+
+        POINT tip = to;
+        POINT left{
+            static_cast<LONG>(to.x - dx * headLen + dy * headWidth),
+            static_cast<LONG>(to.y - dy * headLen - dx * headWidth)
+        };
+        POINT right{
+            static_cast<LONG>(to.x - dx * headLen - dy * headWidth),
+            static_cast<LONG>(to.y - dy * headLen + dx * headWidth)
+        };
+
+        POINT pts[3] = { tip, left, right };
+        Polygon(hdc, pts, 3);
+    }
+
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(brush);
+    DeleteObject(pen);
 }
 
 void ImageEditor::RebuildCanvas() {
@@ -103,97 +127,97 @@ void ImageEditor::RebuildCanvas() {
     DeleteDC(srcDC);
 
     for (const auto& s : strokes_) {
-        HPEN pen = CreatePen(PS_SOLID, s.thickness, s.color);
-        HPEN oldPen = (HPEN)SelectObject(hdcCanvas_, pen);
-        HBRUSH oldBrush = (HBRUSH)SelectObject(hdcCanvas_, GetStockObject(NULL_BRUSH));
-
         if (s.tool == Tool::Freehand && s.points.size() >= 2) {
+            HPEN pen = CreatePen(PS_SOLID, s.thickness, s.color);
+            HPEN oldPen = (HPEN)SelectObject(hdcCanvas_, pen);
             MoveToEx(hdcCanvas_, s.points[0].x, s.points[0].y, nullptr);
             for (size_t i = 1; i < s.points.size(); ++i) {
                 LineTo(hdcCanvas_, s.points[i].x, s.points[i].y);
             }
+            SelectObject(hdcCanvas_, oldPen);
+            DeleteObject(pen);
         }
         else if (s.tool == Tool::Line && s.points.size() == 2) {
+            HPEN pen = CreatePen(PS_SOLID, s.thickness, s.color);
+            HPEN oldPen = (HPEN)SelectObject(hdcCanvas_, pen);
             MoveToEx(hdcCanvas_, s.points[0].x, s.points[0].y, nullptr);
             LineTo(hdcCanvas_, s.points[1].x, s.points[1].y);
+            SelectObject(hdcCanvas_, oldPen);
+            DeleteObject(pen);
         }
         else if (s.tool == Tool::Rectangle && s.points.size() == 2) {
+            HPEN pen = CreatePen(PS_SOLID, s.thickness, s.color);
+            HPEN oldPen = (HPEN)SelectObject(hdcCanvas_, pen);
+            HBRUSH oldBrush = (HBRUSH)SelectObject(hdcCanvas_, GetStockObject(NULL_BRUSH));
             Rectangle(hdcCanvas_, s.points[0].x, s.points[0].y, s.points[1].x, s.points[1].y);
+            SelectObject(hdcCanvas_, oldBrush);
+            SelectObject(hdcCanvas_, oldPen);
+            DeleteObject(pen);
         }
-
-        SelectObject(hdcCanvas_, oldBrush);
-        SelectObject(hdcCanvas_, oldPen);
-        DeleteObject(pen);
+        else if (s.tool == Tool::Arrow && s.points.size() == 2) {
+            DrawArrow(hdcCanvas_, s.points[0], s.points[1], s.thickness, s.color);
+        }
     }
 }
 
 void ImageEditor::CreateControls() {
     auto makeBtn = [&](const wchar_t* text, int x, int id) -> HWND {
-        HWND hwnd = CreateWindowW(L"BUTTON", text,
+        return CreateWindowW(L"BUTTON", text,
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            x, MARGIN_Y_TOP, BTN_W, BTN_H,
+            x, 6, BTN_W, BTN_H,
             hwnd_, (HMENU)(INT_PTR)id, hInst_, nullptr);
-        SendMessageW(hwnd, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-        return hwnd;
     };
 
-    btnFree_  = makeBtn(L"Pencil",   MARGIN_X, 1001);
-    btnLine_  = makeBtn(L"Line",     MARGIN_X + 1 * (BTN_W + 6), 1002);
-    btnRect_  = makeBtn(L"Rect",     MARGIN_X + 2 * (BTN_W + 6), 1003);
-    btnColor_ = makeBtn(L"More...",  MARGIN_X + 3 * (BTN_W + 6), 1004);
-    btnUndo_  = makeBtn(L"Undo",     MARGIN_X + 4 * (BTN_W + 6), 1005);
-    btnCopy_  = makeBtn(L"Copy",     MARGIN_X + 5 * (BTN_W + 6), 1006);
-    btnSave_  = makeBtn(L"Save PNG", MARGIN_X + 6 * (BTN_W + 6), 1007);
+    int x = MARGIN;
+    btnFree_  = makeBtn(L"Pencil", x, 1001); x += BTN_W + 4;
+    btnLine_  = makeBtn(L"Line",   x, 1002); x += BTN_W + 4;
+    btnRect_  = makeBtn(L"Rect",   x, 1003); x += BTN_W + 4;
+    btnArrow_ = makeBtn(L"Arrow",  x, 1004); x += BTN_W + 4;
+    btnUndo_  = makeBtn(L"Undo",   x, 1005); x += BTN_W + 4;
+    btnSave_  = makeBtn(L"Save",   x, 1006); x += BTN_W + 10;
 
-    UpdateToolButtons();
-}
-
-void ImageEditor::UpdateToolButtons() {
-    SetWindowTextW(btnFree_,  (currentTool_ == Tool::Freehand)  ? L"[Pencil]" : L"Pencil");
-    SetWindowTextW(btnLine_,  (currentTool_ == Tool::Line)      ? L"[Line]"   : L"Line");
-    SetWindowTextW(btnRect_,  (currentTool_ == Tool::Rectangle) ? L"[Rect]"   : L"Rect");
+    // Color palette
+    for (int i = 0; i < PALETTE_COUNT; ++i) {
+        btnPalette_[i] = CreateWindowW(L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            x, 8, PALETTE_SIZE, PALETTE_SIZE,
+            hwnd_, (HMENU)(INT_PTR)(1100 + i), hInst_, nullptr);
+        x += PALETTE_SIZE + 3;
+    }
 }
 
 void ImageEditor::OnPaint(HDC hdc) {
-    RECT rcToolbar{ 0, 0, imgW_ + 16, TOOLBAR_H };
+    RECT rc;
+    GetClientRect(hwnd_, &rc);
+
+    // Toolbar background
+    RECT rcToolbar{ 0, 0, rc.right, TOOLBAR_H };
     FillRect(hdc, &rcToolbar, (HBRUSH)(COLOR_BTNFACE + 1));
 
-    BitBlt(hdc, IMAGE_OFFSET_X, IMAGE_OFFSET_Y, imgW_, imgH_, hdcCanvas_, 0, 0, SRCCOPY);
+    // Image area background (in case image is smaller than window)
+    RECT rcImgBg{ 0, TOOLBAR_H, rc.right, rc.bottom };
+    FillRect(hdc, &rcImgBg, (HBRUSH)GetStockObject(WHITE_BRUSH));
 
-    int px = MARGIN_X + PALETTE_BTN_OFFSET * (BTN_W + 6);
-    int py = MARGIN_Y_TOP;
-    for (int i = 0; i < 6; ++i) {
-        RECT rc{ px + i * 28, py, px + i * 28 + 24, py + 24 };
-
-        HBRUSH hBrush = CreateSolidBrush(paletteColors_[i]);
-        FillRect(hdc, &rc, hBrush);
-        DeleteObject(hBrush);
-
-        HPEN pen = CreatePen(PS_SOLID, 1, RGB(150, 150, 150));
-        HPEN oldPen = (HPEN)SelectObject(hdc, pen);
-        HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(pen);
-
-        if (currentColor_ == paletteColors_[i]) {
-            HPEN selPen = CreatePen(PS_SOLID, 2, RGB(0, 120, 215));
-            HPEN oldSel = (HPEN)SelectObject(hdc, selPen);
-            SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            Rectangle(hdc, rc.left - 2, rc.top - 2, rc.right + 2, rc.bottom + 2);
-            SelectObject(hdc, oldSel);
-            DeleteObject(selPen);
-        }
+    // Center the image if the window is larger
+    int imgX = MARGIN;
+    int imgY = TOOLBAR_H + MARGIN;
+    if (rc.right > imgW_ + 2 * MARGIN) {
+        imgX = (rc.right - imgW_) / 2;
+    }
+    if (rc.bottom - TOOLBAR_H > imgH_ + 2 * MARGIN) {
+        imgY = TOOLBAR_H + (rc.bottom - TOOLBAR_H - imgH_) / 2;
     }
 
-    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(100, 100, 100));
-    HPEN oldBp = (HPEN)SelectObject(hdc, borderPen);
-    HBRUSH oldBb = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    Rectangle(hdc, IMAGE_OFFSET_X - 1, IMAGE_OFFSET_Y - 1, IMAGE_OFFSET_X + imgW_ + 1, IMAGE_OFFSET_Y + imgH_ + 1);
-    SelectObject(hdc, oldBb);
-    SelectObject(hdc, oldBp);
-    DeleteObject(borderPen);
+    BitBlt(hdc, imgX, imgY, imgW_, imgH_, hdcCanvas_, 0, 0, SRCCOPY);
+
+    // Border
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(120, 120, 120));
+    HPEN old = (HPEN)SelectObject(hdc, pen);
+    HBRUSH oldB = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, imgX - 1, imgY - 1, imgX + imgW_ + 1, imgY + imgH_ + 1);
+    SelectObject(hdc, oldB);
+    SelectObject(hdc, old);
+    DeleteObject(pen);
 }
 
 void ImageEditor::StartStroke(POINT pt) {
@@ -219,9 +243,7 @@ void ImageEditor::ContinueStroke(POINT pt) {
 
         currentStroke_.points.push_back(pt);
         lastPt_ = pt;
-
-        RECT inv{ IMAGE_OFFSET_X, IMAGE_OFFSET_Y, IMAGE_OFFSET_X + imgW_, IMAGE_OFFSET_Y + imgH_ };
-        InvalidateRect(hwnd_, &inv, FALSE);
+        InvalidateRect(hwnd_, nullptr, FALSE);
     }
     else {
         lastPt_ = pt;
@@ -243,13 +265,12 @@ void ImageEditor::EndStroke(POINT pt) {
         currentStroke_.points.push_back(startPt_);
         currentStroke_.points.push_back(pt);
         strokes_.push_back(std::move(currentStroke_));
+        RebuildCanvas();
     }
-
-    RebuildCanvas();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-void ImageEditor::CopyToClipboard(bool showNotification) {
+void ImageEditor::CopyToClipboard() {
     if (!OpenClipboard(hwnd_)) return;
     EmptyClipboard();
 
@@ -263,35 +284,7 @@ void ImageEditor::CopyToClipboard(bool showNotification) {
     ReleaseDC(nullptr, screenDC);
 
     SetClipboardData(CF_BITMAP, hCopy);
-
-    int w = 0, h = 0;
-    std::vector<uint8_t> bgra;
-    if (GetBitmapData(hCopy, w, h, bgra)) {
-        size_t dibSize = sizeof(BITMAPV5HEADER) + static_cast<size_t>(w) * h * 4;
-        HGLOBAL hDIB = GlobalAlloc(GMEM_MOVEABLE, dibSize);
-        if (hDIB) {
-            auto* pDIB = reinterpret_cast<BITMAPV5HEADER*>(GlobalLock(hDIB));
-            pDIB->bV5Size = sizeof(BITMAPV5HEADER);
-            pDIB->bV5Width = w;
-            pDIB->bV5Height = -h;
-            pDIB->bV5Planes = 1;
-            pDIB->bV5BitCount = 32;
-            pDIB->bV5Compression = BI_RGB;
-            pDIB->bV5SizeImage = static_cast<DWORD>(w) * h * 4;
-
-            uint8_t* pixelsDest = reinterpret_cast<uint8_t*>(pDIB) + sizeof(BITMAPV5HEADER);
-            memcpy(pixelsDest, bgra.data(), bgra.size());
-
-            GlobalUnlock(hDIB);
-            SetClipboardData(CF_DIB, hDIB);
-        }
-    }
-
     CloseClipboard();
-
-    if (showNotification) {
-        MessageBoxW(hwnd_, L"Copied to clipboard", L"SnipTool", MB_OK | MB_ICONINFORMATION);
-    }
 }
 
 void ImageEditor::SaveToFile() {
@@ -313,7 +306,7 @@ void ImageEditor::SaveToFile() {
         return;
     }
 
-    std::vector<uint8_t> rgba(w * h * 4);
+    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4);
     for (int i = 0; i < w * h; ++i) {
         rgba[i * 4 + 0] = bgra[i * 4 + 2];
         rgba[i * 4 + 1] = bgra[i * 4 + 1];
@@ -324,16 +317,15 @@ void ImageEditor::SaveToFile() {
     char pathUtf8[MAX_PATH * 4];
     WideCharToMultiByte(CP_UTF8, 0, path, -1, pathUtf8, sizeof(pathUtf8), nullptr, nullptr);
 
-    std::wstring wpath(path);
-    std::transform(wpath.begin(), wpath.end(), wpath.begin(), ::towlower);
-    bool isBmp = (wpath.length() >= 4) && (wpath.compare(wpath.length() - 4, 4, L".bmp") == 0);
+    std::wstring ext = path;
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+    bool isBmp = ext.size() >= 4 && ext.substr(ext.size() - 4) == L".bmp";
 
-    int ok = isBmp ? stbi_write_bmp(pathUtf8, w, h, 4, rgba.data())
-                   : stbi_write_png(pathUtf8, w, h, 4, rgba.data(), w * 4);
+    int ok = isBmp
+        ? stbi_write_bmp(pathUtf8, w, h, 4, rgba.data())
+        : stbi_write_png(pathUtf8, w, h, 4, rgba.data(), w * 4);
 
-    if (ok) {
-        MessageBoxW(hwnd_, L"Saved successfully", L"SnipTool", MB_OK | MB_ICONINFORMATION);
-    } else {
+    if (!ok) {
         MessageBoxW(hwnd_, L"Failed to save file", L"SnipTool", MB_ICONERROR);
     }
 }
@@ -357,47 +349,55 @@ LRESULT ImageEditor::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case 1001: currentTool_ = Tool::Freehand; break;
         case 1002: currentTool_ = Tool::Line;     break;
         case 1003: currentTool_ = Tool::Rectangle; break;
-        case 1004: {
-            CHOOSECOLORW cc{ sizeof(cc) };
-            static COLORREF cust[16]{};
-            cc.hwndOwner = hwnd_;
-            cc.lpCustColors = cust;
-            cc.rgbResult = currentColor_;
-            cc.Flags = CC_FULLOPEN | CC_RGBINIT;
-            if (ChooseColorW(&cc)) {
-                currentColor_ = cc.rgbResult;
+        case 1004: currentTool_ = Tool::Arrow;    break;
+        case 1005: Undo(); break;
+        case 1006: SaveToFile(); break;
+        default:
+            if (id >= 1100 && id < 1100 + PALETTE_COUNT) {
+                currentColor_ = paletteColors_[id - 1100];
+                InvalidateRect(hwnd_, nullptr, FALSE); // refresh palette selection if needed
             }
             break;
         }
-        case 1005: Undo(); break;
-        case 1006: CopyToClipboard(true); break;
-        case 1007: SaveToFile(); break;
-        }
-        UpdateToolButtons();
-        InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
     }
 
-    case WM_LBUTTONDOWN: {
-        int mx = GET_X_LPARAM(lParam);
-        int my = GET_Y_LPARAM(lParam);
-        int px = MARGIN_X + PALETTE_BTN_OFFSET * (BTN_W + 6);
-        int py = MARGIN_Y_TOP;
+    case WM_DRAWITEM: {
+        auto* dis = reinterpret_cast<LPDRAWITEMSTRUCT>(lParam);
+        if (dis->CtlID >= 1100 && dis->CtlID < 1100 + PALETTE_COUNT) {
+            int idx = dis->CtlID - 1100;
+            HBRUSH br = CreateSolidBrush(paletteColors_[idx]);
+            FillRect(dis->hDC, &dis->rcItem, br);
+            DeleteObject(br);
 
-        if (my >= py && my <= py + 24) {
-            for (int i = 0; i < 6; ++i) {
-                if (mx >= px + i * 28 && mx <= px + i * 28 + 24) {
-                    currentColor_ = paletteColors_[i];
-                    RECT inv{ 0, 0, imgW_ + 16, TOOLBAR_H };
-                    InvalidateRect(hwnd_, &inv, FALSE);
-                    return 0;
-                }
+            // highlight current color
+            if (paletteColors_[idx] == currentColor_) {
+                HPEN pen = CreatePen(PS_SOLID, 2, RGB(0, 0, 0));
+                HPEN old = (HPEN)SelectObject(dis->hDC, pen);
+                HBRUSH oldB = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
+                Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top,
+                          dis->rcItem.right, dis->rcItem.bottom);
+                SelectObject(dis->hDC, oldB);
+                SelectObject(dis->hDC, old);
+                DeleteObject(pen);
             }
+            return TRUE;
         }
+        break;
+    }
 
-        POINT pt = GetImagePoint(lParam);
-        if (pt.x >= 0 && pt.y >= 0 && pt.x < imgW_ && pt.y < imgH_) {
-            StartStroke(pt);
+    case WM_LBUTTONDOWN: {
+        RECT rc;
+        GetClientRect(hwnd_, &rc);
+        int imgX = MARGIN;
+        int imgY = TOOLBAR_H + MARGIN;
+        if (rc.right > imgW_ + 2 * MARGIN) imgX = (rc.right - imgW_) / 2;
+        if (rc.bottom - TOOLBAR_H > imgH_ + 2 * MARGIN) imgY = TOOLBAR_H + (rc.bottom - TOOLBAR_H - imgH_) / 2;
+
+        int x = GET_X_LPARAM(lParam) - imgX;
+        int y = GET_Y_LPARAM(lParam) - imgY;
+        if (x >= 0 && y >= 0 && x < imgW_ && y < imgH_) {
+            StartStroke({ x, y });
             SetCapture(hwnd_);
         }
         return 0;
@@ -405,20 +405,36 @@ LRESULT ImageEditor::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_MOUSEMOVE: {
         if (drawing_) {
-            POINT pt = GetImagePoint(lParam);
-            int px = std::max(0, std::min(imgW_ - 1, static_cast<int>(pt.x)));
-            int py = std::max(0, std::min(imgH_ - 1, static_cast<int>(pt.y)));
-            ContinueStroke({ px, py });
+            RECT rc;
+            GetClientRect(hwnd_, &rc);
+            int imgX = MARGIN;
+            int imgY = TOOLBAR_H + MARGIN;
+            if (rc.right > imgW_ + 2 * MARGIN) imgX = (rc.right - imgW_) / 2;
+            if (rc.bottom - TOOLBAR_H > imgH_ + 2 * MARGIN) imgY = TOOLBAR_H + (rc.bottom - TOOLBAR_H - imgH_) / 2;
+
+            int x = GET_X_LPARAM(lParam) - imgX;
+            int y = GET_Y_LPARAM(lParam) - imgY;
+            x = std::max(0, std::min(imgW_ - 1, x));
+            y = std::max(0, std::min(imgH_ - 1, y));
+            ContinueStroke({ x, y });
         }
         return 0;
     }
 
     case WM_LBUTTONUP: {
         if (drawing_) {
-            POINT pt = GetImagePoint(lParam);
-            int px = std::max(0, std::min(imgW_ - 1, static_cast<int>(pt.x)));
-            int py = std::max(0, std::min(imgH_ - 1, static_cast<int>(pt.y)));
-            EndStroke({ px, py });
+            RECT rc;
+            GetClientRect(hwnd_, &rc);
+            int imgX = MARGIN;
+            int imgY = TOOLBAR_H + MARGIN;
+            if (rc.right > imgW_ + 2 * MARGIN) imgX = (rc.right - imgW_) / 2;
+            if (rc.bottom - TOOLBAR_H > imgH_ + 2 * MARGIN) imgY = TOOLBAR_H + (rc.bottom - TOOLBAR_H - imgH_) / 2;
+
+            int x = GET_X_LPARAM(lParam) - imgX;
+            int y = GET_Y_LPARAM(lParam) - imgY;
+            x = std::max(0, std::min(imgW_ - 1, x));
+            y = std::max(0, std::min(imgH_ - 1, y));
+            EndStroke({ x, y });
             ReleaseCapture();
         }
         return 0;
@@ -437,22 +453,70 @@ LRESULT ImageEditor::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         FillRect(memDC, &rc, (HBRUSH)(COLOR_WINDOW + 1));
         OnPaint(memDC);
 
-        if (drawing_ && (currentTool_ == Tool::Line || currentTool_ == Tool::Rectangle)) {
-            HPEN pen = CreatePen(PS_SOLID, thickness_, currentColor_);
-            HPEN oldPen = (HPEN)SelectObject(memDC, pen);
-            HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, GetStockObject(NULL_BRUSH));
+        // Live preview for line / rect / arrow
+        if (drawing_ && currentTool_ != Tool::Freehand) {
+            int imgX = MARGIN;
+            int imgY = TOOLBAR_H + MARGIN;
+            if (rc.right > imgW_ + 2 * MARGIN) imgX = (rc.right - imgW_) / 2;
+            if (rc.bottom - TOOLBAR_H > imgH_ + 2 * MARGIN) imgY = TOOLBAR_H + (rc.bottom - TOOLBAR_H - imgH_) / 2;
+
+            POINT p1{ imgX + startPt_.x, imgY + startPt_.y };
+            POINT p2{ imgX + lastPt_.x,  imgY + lastPt_.y };
 
             if (currentTool_ == Tool::Line) {
-                MoveToEx(memDC, IMAGE_OFFSET_X + startPt_.x, IMAGE_OFFSET_Y + startPt_.y, nullptr);
-                LineTo(memDC, IMAGE_OFFSET_X + lastPt_.x, IMAGE_OFFSET_Y + lastPt_.y);
-            } else {
-                Rectangle(memDC,
-                    IMAGE_OFFSET_X + startPt_.x, IMAGE_OFFSET_Y + startPt_.y,
-                    IMAGE_OFFSET_X + lastPt_.x, IMAGE_OFFSET_Y + lastPt_.y);
+                HPEN pen = CreatePen(PS_SOLID, thickness_, currentColor_);
+                HPEN oldPen = (HPEN)SelectObject(memDC, pen);
+                MoveToEx(memDC, p1.x, p1.y, nullptr);
+                LineTo(memDC, p2.x, p2.y);
+                SelectObject(memDC, oldPen);
+                DeleteObject(pen);
             }
-            SelectObject(memDC, oldBrush);
-            SelectObject(memDC, oldPen);
-            DeleteObject(pen);
+            else if (currentTool_ == Tool::Rectangle) {
+                HPEN pen = CreatePen(PS_SOLID, thickness_, currentColor_);
+                HPEN oldPen = (HPEN)SelectObject(memDC, pen);
+                HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, GetStockObject(NULL_BRUSH));
+                Rectangle(memDC, p1.x, p1.y, p2.x, p2.y);
+                SelectObject(memDC, oldBrush);
+                SelectObject(memDC, oldPen);
+                DeleteObject(pen);
+            }
+            else if (currentTool_ == Tool::Arrow) {
+                // temporary DC offset is awkward, just draw in image coords then offset is hard;
+                // simpler: draw arrow in canvas coords temporarily on memDC by translating
+                // For preview we draw directly with offset.
+                HPEN pen = CreatePen(PS_SOLID, thickness_, currentColor_);
+                HPEN oldPen = (HPEN)SelectObject(memDC, pen);
+                HBRUSH brush = CreateSolidBrush(currentColor_);
+                HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, brush);
+
+                MoveToEx(memDC, p1.x, p1.y, nullptr);
+                LineTo(memDC, p2.x, p2.y);
+
+                double dx = static_cast<double>(p2.x - p1.x);
+                double dy = static_cast<double>(p2.y - p1.y);
+                double len = std::sqrt(dx * dx + dy * dy);
+                if (len > 1.0) {
+                    dx /= len; dy /= len;
+                    const double headLen = (std::max)(12.0, thickness_ * 4.0);
+                    const double headWidth = headLen * 0.5;
+                    POINT tip = p2;
+                    POINT left{
+                        static_cast<LONG>(p2.x - dx * headLen + dy * headWidth),
+                        static_cast<LONG>(p2.y - dy * headLen - dx * headWidth)
+                    };
+                    POINT right{
+                        static_cast<LONG>(p2.x - dx * headLen - dy * headWidth),
+                        static_cast<LONG>(p2.y - dy * headLen + dx * headWidth)
+                    };
+                    POINT pts[3] = { tip, left, right };
+                    Polygon(memDC, pts, 3);
+                }
+
+                SelectObject(memDC, oldBrush);
+                SelectObject(memDC, oldPen);
+                DeleteObject(brush);
+                DeleteObject(pen);
+            }
         }
 
         BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
@@ -507,26 +571,23 @@ void ImageEditor::Run() {
     wc.lpszClassName = L"SnipEditorClass";
     RegisterClassExW(&wc);
 
-    int winW = std::max(MIN_WIN_W, imgW_ + 24);
-    int winH = std::max(MIN_WIN_H, imgH_ + TOOLBAR_H + 48);
+    // Minimum width so all buttons + palette are visible
+    const int minToolbarW = MARGIN + 6 * (BTN_W + 4) + 10 + PALETTE_COUNT * (PALETTE_SIZE + 3) + MARGIN + 20;
+    int winW = (std::max)(imgW_ + 2 * MARGIN + 16, minToolbarW);
+    int winH = imgH_ + TOOLBAR_H + 2 * MARGIN + 40; // extra for caption
 
+    // Center near selection
     int x = screenRect_.left + (screenRect_.right - screenRect_.left - winW) / 2;
     int y = screenRect_.top  + (screenRect_.bottom - screenRect_.top - winH) / 2;
 
-    RECT workArea;
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
-    int workLeft   = static_cast<int>(workArea.left);
-    int workTop    = static_cast<int>(workArea.top);
-    int workRight  = static_cast<int>(workArea.right);
-    int workBottom = static_cast<int>(workArea.bottom);
-
-    x = std::max(workLeft, std::min(x, workRight - winW));
-    y = std::max(workTop, std::min(y, workBottom - winH));
+    // Keep on screen
+    x = (std::max)(0, x);
+    y = (std::max)(0, y);
 
     hwnd_ = CreateWindowExW(
         WS_EX_TOOLWINDOW,
-        L"SnipEditorClass", L"SnipTool Editor",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        L"SnipEditorClass", L"SnipTool Editor  (close = copy to clipboard)",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME,
         x, y, winW, winH,
         nullptr, nullptr, hInst_, this);
 
@@ -535,8 +596,6 @@ void ImageEditor::Run() {
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
     SetForegroundWindow(hwnd_);
-
-    CopyToClipboard(false);
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0)) {

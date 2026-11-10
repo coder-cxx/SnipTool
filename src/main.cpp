@@ -6,17 +6,15 @@
 
 #include "SnipOverlay.hpp"
 #include "ImageEditor.hpp"
-#include "resource.h" 
+#include "resource.h"
 
-// Hotkey ID
 constexpr int HOTKEY_ID = 1;
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 
-// Global instance for message handling
 HINSTANCE g_hInstance = nullptr;
 HWND g_hwndMain = nullptr;
 NOTIFYICONDATAW g_nid{};
-HICON g_hAppIcon = nullptr;
+HICON g_hTrayIcon = nullptr;
 
 void ShowTrayMenu(HWND hwnd) {
     POINT pt;
@@ -29,7 +27,6 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, 2, L"Exit");
 
-    // Required so the menu closes correctly when clicking outside
     SetForegroundWindow(hwnd);
 
     UINT cmd = TrackPopupMenu(hMenu,
@@ -37,12 +34,9 @@ void ShowTrayMenu(HWND hwnd) {
         pt.x, pt.y, 0, hwnd, nullptr);
 
     DestroyMenu(hMenu);
-
-    // Required after TrackPopupMenu
     PostMessageW(hwnd, WM_NULL, 0, 0);
 
     if (cmd == 1) {
-        // Trigger capture the same way as hotkey
         PostMessageW(hwnd, WM_HOTKEY, HOTKEY_ID, 0);
     }
     else if (cmd == 2) {
@@ -69,7 +63,6 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             ShowTrayMenu(hwnd);
         }
         else if (lParam == WM_LBUTTONDBLCLK) {
-            // Double-click also starts capture
             PostMessageW(hwnd, WM_HOTKEY, HOTKEY_ID, 0);
         }
         break;
@@ -77,6 +70,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_DESTROY:
         UnregisterHotKey(hwnd, HOTKEY_ID);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        if (g_hTrayIcon) {
+            DestroyIcon(g_hTrayIcon);
+            g_hTrayIcon = nullptr;
+        }
         PostQuitMessage(0);
         break;
 
@@ -89,23 +86,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     g_hInstance = hInstance;
 
-    /*
-    g_hAppIcon = (HICON)LoadImageW(
-        hInstance,
-        MAKEINTRESOURCEW(IDI_APP_ICON),
-        IMAGE_ICON,
-        32, 32,
-        LR_DEFAULTCOLOR);*/
-
-    g_hAppIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APP_ICON));
-
-
-    // Register a hidden message-only window to receive hotkeys
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.lpfnWndProc = MainWndProc;
     wc.hInstance = hInstance;
-    wc.hIcon = g_hAppIcon;
-    wc.hIconSm = g_hAppIcon;
     wc.lpszClassName = L"SnipToolMainClass";
     RegisterClassExW(&wc);
 
@@ -119,25 +102,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         return 1;
     }
 
-    // Register global hotkey: Ctrl + Shift + S
     if (!RegisterHotKey(g_hwndMain, HOTKEY_ID, MOD_CONTROL | MOD_SHIFT, 'S')) {
         MessageBoxW(nullptr, L"Failed to register hotkey Ctrl+Shift+S.\nMaybe already in use.", L"SnipTool", MB_ICONWARNING);
     }
 
-    // Tray icon
+    // Load icon from embedded resources
+    g_hTrayIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_TRAYICON));
+    if (!g_hTrayIcon) {
+        // Fallback if resource missing
+        g_hTrayIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    }
+
     g_nid = { sizeof(g_nid) };
     g_nid.hWnd = g_hwndMain;
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    //g_nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); // IDI_APPLICATION
-    g_nid.hIcon = g_hAppIcon;
-
+    g_nid.hIcon = g_hTrayIcon;
     wcscpy_s(g_nid.szTip, L"SnipTool — Ctrl+Shift+S to capture");
-
     Shell_NotifyIconW(NIM_ADD, &g_nid);
-    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-    
+
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);

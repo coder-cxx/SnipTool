@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(SnipTool VERSION 1.0 LANGUAGES CXX)
+project(SnipTool VERSION 1.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,10 +17,18 @@ add_executable(SnipTool WIN32
     src/main.cpp
     src/SnipOverlay.cpp
     src/ImageEditor.cpp
-    src/app.rc
+    resources/SnipTool.rc
 )
 
-target_include_directories(SnipTool PRIVATE include)
+target_include_directories(SnipTool PRIVATE
+    include
+    resources
+)
+
+# Resource compiler needs to find scissor.ico relative to the .rc file
+set_source_files_properties(resources/SnipTool.rc PROPERTIES
+    COMPILE_FLAGS "/I${CMAKE_CURRENT_SOURCE_DIR}/resources"
+)
 
 target_link_libraries(SnipTool PRIVATE
     gdi32
@@ -31,7 +39,6 @@ target_link_libraries(SnipTool PRIVATE
     comdlg32
 )
 
-# For MinGW static runtime
 if(MINGW)
     target_link_libraries(SnipTool PRIVATE -static-libgcc -static-libstdc++)
 endif()

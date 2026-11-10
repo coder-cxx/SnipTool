@@ -2,8 +2,8 @@
 #define NOMINMAX
 #include "SnipOverlay.hpp"
 #include <windowsx.h>
-#include <vector>
 #include <algorithm>
+#include <vector>
 
 namespace {
 
@@ -21,6 +21,8 @@ struct OverlayState {
     HBITMAP oldBmp = nullptr;
     int screenW = 0;
     int screenH = 0;
+    int screenLeft = 0;
+    int screenTop = 0;
 };
 
 OverlayState g_state;
@@ -36,14 +38,13 @@ void CleanupMem() {
     }
 }
 
-// Capture full virtual screen into memory DC
 bool CaptureFullScreen() {
     CleanupMem();
 
+    g_state.screenLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    g_state.screenTop  = GetSystemMetrics(SM_YVIRTUALSCREEN);
     g_state.screenW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     g_state.screenH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int top  = GetSystemMetrics(SM_YVIRTUALSCREEN);
 
     HDC screenDC = GetDC(nullptr);
     g_state.memDC = CreateCompatibleDC(screenDC);
@@ -51,61 +52,124 @@ bool CaptureFullScreen() {
     g_state.oldBmp = (HBITMAP)SelectObject(g_state.memDC, g_state.memBmp);
 
     BitBlt(g_state.memDC, 0, 0, g_state.screenW, g_state.screenH,
-           screenDC, left, top, SRCCOPY | CAPTUREBLT);
+           screenDC, g_state.screenLeft, g_state.screenTop, SRCCOPY | CAPTUREBLT);
 
     ReleaseDC(nullptr, screenDC);
     return g_state.memBmp != nullptr;
 }
 
-void DrawOverlay(HDC hdc) {
-    RECT full{ 0, 0, g_state.screenW, g_state.screenH };
+// Create a 32-bit ARGB dibsection for layered window
+HBITMAP CreateARGBSurface(int w, int h, void** bits) {
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h; // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
 
-    // First blit the original screenshot
-    BitBlt(hdc, 0, 0, g_state.screenW, g_state.screenH, g_state.memDC, 0, 0, SRCCOPY);
+    HDC hdc = GetDC(nullptr);
+    HBITMAP bmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, bits, nullptr, 0);
+    ReleaseDC(nullptr, hdc);
+    return bmp;
+}
 
-    // Semi-transparent dark overlay via AlphaBlend
-    HDC dimDC = CreateCompatibleDC(hdc);
-    HBITMAP dimBmp = CreateCompatibleBitmap(hdc, g_state.screenW, g_state.screenH);
-    HBITMAP oldDim = (HBITMAP)SelectObject(dimDC, dimBmp);
+void UpdateLayeredContent(HWND hwnd) {
+    void* bits = nullptr;
+    HBITMAP argbBmp = CreateARGBSurface(g_state.screenW, g_state.screenH, &bits);
+    if (!argbBmp || !bits) return;
 
-    HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(dimDC, &full, black);
-    DeleteObject(black);
+    // Copy original screenshot into ARGB (BGRX -> BGRA with full alpha)
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = g_state.screenW;
+    bmi.bmiHeader.biHeight = -g_state.screenH;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
 
-    BLENDFUNCTION bf{ AC_SRC_OVER, 0, 160, 0 }; // ~62% opacity dark
-    AlphaBlend(hdc, 0, 0, g_state.screenW, g_state.screenH,
-               dimDC, 0, 0, g_state.screenW, g_state.screenH, bf);
+    HDC hdcScreen = GetDC(nullptr);
+    GetDIBits(hdcScreen, g_state.memBmp, 0, g_state.screenH, bits, &bmi, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, hdcScreen);
 
-    SelectObject(dimDC, oldDim);
-    DeleteObject(dimBmp);
-    DeleteDC(dimDC);
+    uint8_t* p = static_cast<uint8_t*>(bits);
+    const int total = g_state.screenW * g_state.screenH;
 
-    // If selecting — clear the selection area (show original) and draw border
+    // Darken everything (aggressive ~70% black overlay)
+    for (int i = 0; i < total; ++i) {
+        // pre-multiplied-ish darken
+        p[0] = static_cast<uint8_t>(p[0] * 0.30); // B
+        p[1] = static_cast<uint8_t>(p[1] * 0.30); // G
+        p[2] = static_cast<uint8_t>(p[2] * 0.30); // R
+        p[3] = 255; // A fully opaque (we darken the content itself)
+        p += 4;
+    }
+
+    // Restore original brightness inside selection rectangle
     if (g_state.selecting || g_state.finished) {
         int x1 = (std::min)(g_state.start.x, g_state.current.x);
         int y1 = (std::min)(g_state.start.y, g_state.current.y);
         int x2 = (std::max)(g_state.start.x, g_state.current.x);
         int y2 = (std::max)(g_state.start.y, g_state.current.y);
 
-        // Blit original pixels into selection rect
-        BitBlt(hdc, x1, y1, x2 - x1, y2 - y1, g_state.memDC, x1, y1, SRCCOPY);
+        // clamp
+        x1 = (std::max)(0, x1); y1 = (std::max)(0, y1);
+        x2 = (std::min)(g_state.screenW, x2); y2 = (std::min)(g_state.screenH, y2);
 
-        // Draw selection border
-        HPEN pen = CreatePen(PS_SOLID, 2, RGB(0, 120, 215));
-        HPEN oldPen = (HPEN)SelectObject(hdc, pen);
-        HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Rectangle(hdc, x1, y1, x2, y2);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(pen);
+        // Get original bits again for the rect
+        std::vector<uint8_t> orig(g_state.screenW * g_state.screenH * 4);
+        HDC hdc = GetDC(nullptr);
+        GetDIBits(hdc, g_state.memBmp, 0, g_state.screenH, orig.data(), &bmi, DIB_RGB_COLORS);
+        ReleaseDC(nullptr, hdc);
 
-        // Size text
-        wchar_t sizeText[64];
-        swprintf_s(sizeText, L"%d × %d", x2 - x1, y2 - y1);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(255, 255, 255));
-        TextOutW(hdc, x1 + 4, y1 + 4, sizeText, (int)wcslen(sizeText));
+        for (int y = y1; y < y2; ++y) {
+            for (int x = x1; x < x2; ++x) {
+                int idx = (y * g_state.screenW + x) * 4;
+                uint8_t* dst = static_cast<uint8_t*>(bits) + idx;
+                dst[0] = orig[idx + 0];
+                dst[1] = orig[idx + 1];
+                dst[2] = orig[idx + 2];
+                dst[3] = 255;
+            }
+        }
+
+        // Draw selection border (simple blue-ish)
+        auto setPixel = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+            if (x < 0 || y < 0 || x >= g_state.screenW || y >= g_state.screenH) return;
+            int idx = (y * g_state.screenW + x) * 4;
+            uint8_t* d = static_cast<uint8_t*>(bits) + idx;
+            d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+        };
+
+        // 2px border
+        for (int t = 0; t < 2; ++t) {
+            for (int x = x1; x < x2; ++x) {
+                setPixel(x, y1 + t, 0, 120, 215);
+                setPixel(x, y2 - 1 - t, 0, 120, 215);
+            }
+            for (int y = y1; y < y2; ++y) {
+                setPixel(x1 + t, y, 0, 120, 215);
+                setPixel(x2 - 1 - t, y, 0, 120, 215);
+            }
+        }
     }
+
+    // Update the layered window
+    HDC hdcScreen2 = GetDC(nullptr);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen2);
+    HBITMAP old = (HBITMAP)SelectObject(hdcMem, argbBmp);
+
+    POINT ptSrc{ 0, 0 };
+    POINT ptDst{ g_state.screenLeft, g_state.screenTop };
+    SIZE size{ g_state.screenW, g_state.screenH };
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+
+    UpdateLayeredWindow(hwnd, hdcScreen2, &ptDst, &size, hdcMem, &ptSrc, 0, &bf, ULW_ALPHA);
+
+    SelectObject(hdcMem, old);
+    DeleteDC(hdcMem);
+    ReleaseDC(nullptr, hdcScreen2);
+    DeleteObject(argbBmp);
 }
 
 LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -120,14 +184,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         g_state.start.y = GET_Y_LPARAM(lParam);
         g_state.current = g_state.start;
         SetCapture(hwnd);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        UpdateLayeredContent(hwnd);
         return 0;
 
     case WM_MOUSEMOVE:
         if (g_state.selecting) {
             g_state.current.x = GET_X_LPARAM(lParam);
             g_state.current.y = GET_Y_LPARAM(lParam);
-            InvalidateRect(hwnd, nullptr, FALSE);
+            UpdateLayeredContent(hwnd);
         }
         return 0;
 
@@ -158,17 +222,6 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
 
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-        DrawOverlay(hdc);
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-
-    case WM_ERASEBKGND:
-        return 1; // we paint everything
-
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -187,7 +240,6 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
         return nullptr;
     }
 
-    // Register class
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = OverlayProc;
@@ -196,14 +248,11 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
     wc.lpszClassName = L"SnipOverlayClass";
     RegisterClassExW(&wc);
 
-    int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int top  = GetSystemMetrics(SM_YVIRTUALSCREEN);
-
     HWND hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
         L"SnipOverlayClass", L"",
         WS_POPUP,
-        left, top, g_state.screenW, g_state.screenH,
+        g_state.screenLeft, g_state.screenTop, g_state.screenW, g_state.screenH,
         nullptr, nullptr, hInstance, nullptr);
 
     if (!hwnd) {
@@ -213,12 +262,13 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
 
     g_state.hwnd = hwnd;
 
+    // Initial full dim
+    UpdateLayeredContent(hwnd);
+
     ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
     SetForegroundWindow(hwnd);
     SetFocus(hwnd);
 
-    // Message loop for the overlay
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
@@ -232,7 +282,9 @@ HBITMAP SnipOverlay::CaptureRegion(HINSTANCE hInstance, RECT& selected) {
     if (g_state.finished && !g_state.cancelled) {
         selected = g_state.result;
 
-        // Create bitmap of just the selected region
+        // Convert selection coords from client (relative to virtual screen origin) 
+        // already correct because window is at virtual screen origin.
+
         int w = selected.right - selected.left;
         int h = selected.bottom - selected.top;
 

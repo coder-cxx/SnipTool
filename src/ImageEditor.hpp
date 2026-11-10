@@ -6,14 +6,15 @@
 enum class Tool {
     Freehand,
     Line,
-    Rectangle
+    Rectangle,
+    Arrow
 };
 
 struct DrawStroke {
     Tool tool;
     COLORREF color;
     int thickness;
-    std::vector<POINT> points;
+    std::vector<POINT> points; // freehand: many; line/rect/arrow: 2
 };
 
 class ImageEditor {
@@ -21,7 +22,7 @@ public:
     ImageEditor(HINSTANCE hInstance, HBITMAP hSourceBmp, const RECT& screenRect);
     ~ImageEditor();
 
-    void Run();
+    void Run(); // modal message loop
 
 private:
     HINSTANCE hInst_;
@@ -45,13 +46,26 @@ private:
     std::vector<DrawStroke> strokes_;
     DrawStroke currentStroke_;
 
-    HWND btnCopy_ = nullptr;
-    HWND btnSave_ = nullptr;
-    HWND btnUndo_ = nullptr;
+    // UI controls
     HWND btnFree_ = nullptr;
     HWND btnLine_ = nullptr;
     HWND btnRect_ = nullptr;
-    HWND btnColor_ = nullptr;
+    HWND btnArrow_ = nullptr;
+    HWND btnUndo_ = nullptr;
+    HWND btnSave_ = nullptr;
+    // palette buttons
+    static constexpr int PALETTE_COUNT = 8;
+    HWND btnPalette_[PALETTE_COUNT]{};
+    COLORREF paletteColors_[PALETTE_COUNT] = {
+        RGB(255, 0, 0),     // red
+        RGB(0, 180, 0),     // green
+        RGB(0, 100, 255),   // blue
+        RGB(255, 200, 0),   // yellow
+        RGB(255, 100, 0),   // orange
+        RGB(180, 0, 255),   // purple
+        RGB(0, 0, 0),       // black
+        RGB(255, 255, 255)  // white
+    };
 
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
     LRESULT HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam);
@@ -62,19 +76,8 @@ private:
     void StartStroke(POINT pt);
     void ContinueStroke(POINT pt);
     void EndStroke(POINT pt);
-    void CopyToClipboard(bool showNotification = true);
+    void CopyToClipboard();
     void SaveToFile();
     void Undo();
-    void UpdateToolButtons();
-
-    // Палитра
-    static constexpr int PALETTE_BTN_OFFSET = 7;
-    inline static constexpr COLORREF paletteColors_[6] = {
-        RGB(255, 0, 0),    // Red
-        RGB(0, 255, 0),    // Green
-        RGB(0, 0, 255),    // Blue
-        RGB(255, 255, 0),  // Yellow
-        RGB(0, 0, 0),      // Black
-        RGB(255, 255, 255) // White
-    };
+    void DrawArrow(HDC hdc, POINT from, POINT to, int thickness, COLORREF color);
 };
